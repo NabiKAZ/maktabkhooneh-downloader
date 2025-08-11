@@ -291,6 +291,18 @@ function extractVideoSources(html) {
     }
     return Array.from(new Set(urls));
 }
+// Extract subtitle (.vtt) URLs from lecture page HTML.
+function extractSubtitleSources(html) {
+    const urls = [];
+    const re = /href=["']([^"'>]+\.vtt[^"'>]*)["']/gim;
+    let m;
+    while ((m = re.exec(html)) !== null) {
+        const raw = m[1];
+        const url = decodeHtmlEntities(raw);
+        if (url && url.endsWith('.vtt')) urls.push(url);
+    }
+    return Array.from(new Set(urls));
+}
 
 // Pick best source, prefer HQ.
 function pickBestSource(urls) {
@@ -567,6 +579,36 @@ async function main() {
                     if (status === 'exists') { console.log(paintYellow(`🟡 SKIP exists: ${finalFileName}`)); skippedCount++; }
                     else { logSuccess(`DOWNLOADED: ${finalFileName}`); downloadedCount++; }
 
+                    // After downloading the video, attempt to download the subtitle
+                    const subtitleUrls = extractSubtitleSources(html);
+                    if (subtitleUrls.length > 0) {
+                        for (const subUrl of subtitleUrls) {
+                            try {
+                                const subtitleFileName = finalFileName.replace(/\.mp4$/i, '.vtt');
+                                const subtitlePath = path.join(chapterFolder, subtitleFileName);
+                    
+                                console.log(`📝 Downloading subtitle: ${subtitleFileName}`);
+                                const statusSub = await downloadToFile(
+                                    subUrl.startsWith('http') ? subUrl : `${ORIGIN}${subUrl}`,
+                                    subtitlePath,
+                                    lectureUrl,
+                                    3,
+                                    0,
+                                    ''
+                                );
+                                if (statusSub === 'exists') {
+                                    console.log(paintYellow(`🟡 SKIP exists: ${subtitleFileName}`));
+                                } else {
+                                    logSuccess(`DOWNLOADED: ${subtitleFileName}`);
+                                }
+                            } catch (err) {
+                                logWarn(`Subtitle download failed: ${err.message}`);
+                            }
+                        }
+                    } else {
+                        logWarn('No subtitle found for this lecture.');
+                    }
+
                     // polite pause
                     await sleep(400);
                 } catch (err) {
@@ -585,3 +627,4 @@ async function main() {
 }
 
 main().catch(err => { logError('Fatal:', err); process.exit(1); });
+
