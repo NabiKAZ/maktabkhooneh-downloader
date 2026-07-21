@@ -218,6 +218,18 @@ function extractCourseSlug(courseUrl) {
     }
 }
 
+function extractRequestedUnitId(courseUrl) {
+    try {
+        const parsed = new URL(courseUrl);
+        const parts = parsed.pathname.split('/').filter(Boolean);
+        const idx = parts.indexOf('unit');
+        if (idx !== -1 && parts[idx + 1] && /^\d+$/.test(parts[idx + 1])) {
+            return Number(parts[idx + 1]);
+        }
+    } catch { }
+    return null;
+}
+
 // Fetch with timeout.
 async function fetchWithTimeout(url, options = {}, timeoutMs = 60_000) {
     const controller = new AbortController();
@@ -267,6 +279,35 @@ async function fetchChapters(courseSlug, referer) {
     return res.json();
 }
 
+async function fetchUnitVideoData(unitId, referer) {
+    if (unitId == null) return null;
+    const apiUrl = `${ORIGIN}/api/v1/lms/units/${encodeURIComponent(String(unitId))}/video_url/`;
+    const res = await fetchWithTimeout(apiUrl, {
+        method: 'GET',
+        headers: { ...commonHeaders(referer), accept: 'application/json' }
+    });
+    if (!res.ok) throw new Error(`Failed to fetch unit video data: ${res.status} ${res.statusText}`);
+    return res.json();
+}
+
+function extractVideoSourcesFromUnitVideoData(data) {
+    const urls = [];
+    const add = (url) => {
+        if (!url) return;
+        urls.push(decodeHtmlEntities(String(url)));
+    };
+
+    if (Array.isArray(data?.qualities)) {
+        for (const quality of data.qualities) add(quality?.download_url);
+    }
+    add(data?.hls?.master_url);
+    if (Array.isArray(data?.hls?.qualities)) {
+        for (const quality of data.hls.qualities) add(quality?.url);
+    }
+
+    return Array.from(new Set(urls));
+}
+
 // API: core-data to verify authentication and basic profile.
 async function fetchCoreData(referer) {
     const url = `${ORIGIN}/api/v1/general/core-data/?profile=1`;
@@ -291,6 +332,9 @@ function printProfileSummary(core) {
 
 // Build lecture page URL for a specific chapter/unit.
 function buildLectureUrl(courseSlug, chapter, unit) {
+    if (unit?.id != null) {
+        return `${ORIGIN}/lms/course/${courseSlug}/unit/${encodeURIComponent(String(unit.id))}/`;
+    }
     const chapterSegment = `${encodeURIComponent(chapter.slug)}-ch${chapter.id}`;
     const unitSegment = encodeURIComponent(unit.slug);
     return `${ORIGIN}/course/${courseSlug}/${chapterSegment}/${unitSegment}/`;
@@ -309,24 +353,58 @@ function decodeHtmlEntities(str) {
         .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCharCode(parseInt(h, 16)));
 }
 
-// Extract <source ... src="..."> URLs from lecture page HTML.
+// Extract video URLs from lecture page HTML.
 function extractVideoSources(html) {
     const urls = [];
-    const re = /<source\b[^>]*?src=["']([^"'>]+)["'][^>]*>/gim;
+
+    const addCandidate = (raw) => {
+        if (!raw) return;
+        let url = decodeHtmlEntities(String(raw).trim())
+            .replace(/\\u002f/gi, '/')
+            .replace(/\\u0026/gi, '&')
+            .replace(/\\u003d/gi, '=')
+            .replace(/\\\//g, '/');
+        if (url.startsWith('//')) url = 'https:' + url;
+        try { url = new URL(url, ORIGIN).toString(); } catch { }
+
+        const lower = url.toLowerCase();
+        if (
+            lower.includes('/videos/') ||
+            /\.(mp4|m3u8)(?:[?#]|$)/i.test(lower)
+        ) {
+            urls.push(url);
+        }
+    };
+
+    // Current Nuxt/Vidstack pages render <video src="...">, while older pages
+    // used <source src="...">. Scan common URL-bearing attributes instead.
+    const attrRe = /\b(?:src|href|data-src|data-url|data-video|data-file|poster)=["']([^"']+)["']/gim;
     let m;
-    while ((m = re.exec(html)) !== null) {
-        const raw = m[1];
-        const url = decodeHtmlEntities(raw);
-        if (url && url.includes('/videos/')) urls.push(url);
+    while ((m = attrRe.exec(html)) !== null) {
+        addCandidate(m[1]);
     }
+
+    // Also support serialized app state where the source is stored as JSON.
+    const jsonValueRe = /["'](?:src|url|file|video|video_url|videoUrl|source|download_url)["']\s*:\s*["']([^"']+)["']/gim;
+    while ((m = jsonValueRe.exec(html)) !== null) {
+        addCandidate(m[1]);
+    }
+
+    // Last fallback: any direct MP4/HLS URL embedded in the HTML.
+    const directUrlRe = /https?:\/\/[^\s"'<>\\]+(?:\.mp4|\.m3u8)(?:[^\s"'<>\\]*)?/gim;
+    while ((m = directUrlRe.exec(html)) !== null) {
+        addCandidate(m[0]);
+    }
+
     return Array.from(new Set(urls));
 }
 
 // Pick best source, prefer HQ.
 function pickBestSource(urls) {
     if (!urls || urls.length === 0) return null;
-    const hq = urls.find(u => /\/videos\/hq\d+/.test(u) || u.includes('/videos/hq'));
-    return hq || urls[0];
+    const mp4s = urls.filter(u => /\.mp4(?:[?#]|$)/i.test(u));
+    const hq = mp4s.find(u => /\/videos\/hq\d+/i.test(u) || u.includes('/videos/hq'));
+    return hq || mp4s[0] || urls[0];
 }
 
 // Sanitize a string for safe Windows filenames.
@@ -876,6 +954,7 @@ async function main() {
 
     const normalizedCourseUrl = ensureTrailingSlash(inputCourseUrl.trim());
     const courseSlug = extractCourseSlug(normalizedCourseUrl);
+    const requestedUnitId = extractRequestedUnitId(normalizedCourseUrl);
     // Use decoded slug (human-friendly, especially for Persian) for the top-level folder name
     const courseDisplayName = sanitizeName(decodeURIComponent(courseSlug));
     const outputRootFolder = path.resolve(process.cwd(), 'download', courseDisplayName);
@@ -920,6 +999,7 @@ async function main() {
             const units = Array.isArray(chapter.units) ? chapter.units : (Array.isArray(chapter.unit_set) ? chapter.unit_set : []);
             for (let unitIndex = 0; unitIndex < units.length; unitIndex++) {
                 const unit = units[unitIndex];
+                if (requestedUnitId != null && Number(unit?.id) !== requestedUnitId) continue;
                 // Old API: skip if status is explicitly falsy; new API has no status field so skip this check
                 if ('status' in unit && !unit.status) continue; // inactive (old API)
                 if (unit?.type !== 'lecture') continue; // skip non-video units
@@ -947,7 +1027,11 @@ async function main() {
                     const res = await fetchWithTimeout(lectureUrl, { headers: { ...commonHeaders(normalizedCourseUrl), accept: 'text/html' } });
                     if (!res.ok) throw new Error(`HTTP ${res.status}`);
                     const html = await res.text();
-                    const videoSources = extractVideoSources(html);
+                    let videoSources = extractVideoSources(html);
+                    if (videoSources.length === 0 && unit?.id != null) {
+                        const unitVideoData = await fetchUnitVideoData(unit.id, lectureUrl);
+                        videoSources = extractVideoSourcesFromUnitVideoData(unitVideoData);
+                    }
                     const bestSourceUrl = pickBestSource(videoSources);
                     if (!bestSourceUrl) { logWarn(`No video source found for: ${finalFileName}`); skippedCount++; continue; }
 
