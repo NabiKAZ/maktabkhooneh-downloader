@@ -1,20 +1,25 @@
-// downloader.js (Final Corrected & Complete Version)
+// downloader.js (v1.3.0) - Upgraded with Maktabkhooneh Nuxt 3 LMS & High-Res Support
+// Compatible with Node.js and pkg executable builder
+
 const fs = require('fs');
 const path = require('path');
 const { Transform, Readable } = require('stream');
 const { pipeline } = require('stream/promises');
 const { setTimeout: sleep } = require('timers/promises');
 const https = require('https');
-const fetch = require('node-fetch'); // FIX: Use node-fetch v2 for pkg compatibility
+
+// Fallback fetch wrapper for broad Node.js / pkg compatibility
+const fetch = typeof globalThis.fetch === 'function' ? globalThis.fetch : require('node-fetch');
 
 // ===============
-// Console styling (ANSI colors) and emojis
+// Console Styling (ANSI Colors) & Logging Helpers
 // ===============
 const COLOR = {
     reset: '\u001b[0m', bold: '\u001b[1m', dim: '\u001b[2m',
     red: '\u001b[31m', green: '\u001b[32m', yellow: '\u001b[33m', blue: '\u001b[34m', magenta: '\u001b[35m', cyan: '\u001b[36m',
     lightBlue: '\u001b[94m'
 };
+
 const paint = (code, s) => `${code}${s}${COLOR.reset}`;
 const paintBold = s => paint(COLOR.bold, s);
 const paintGreen = s => paint(COLOR.green, s);
@@ -22,36 +27,63 @@ const paintRed = s => paint(COLOR.red, s);
 const paintYellow = s => paint(COLOR.yellow, s);
 const paintCyan = s => paint(COLOR.cyan, s);
 const paintBoldCyan = s => `${COLOR.bold}${COLOR.cyan}${s}${COLOR.reset}`;
-const paintBlue = s => paint(COLOR.blue, s);
 const paintLightBlue = s => paint(COLOR.lightBlue, s);
 
-if (process.platform === 'win32') {
-    console.log(paint(COLOR.dim, '(راهنمایی: اگر کاراکترها یا ایموجی‌ها در ویندوز به درستی نمایش داده نمی‌شوند، از Windows Terminal استفاده کنید یا دستور "chcp 65001" را اجرا نمایید.)'));
+let LOG_WRITER = null;
+
+function formatLogMessage(parts) {
+    return parts.map(p => typeof p === 'string' ? p : JSON.stringify(p)).join(' ');
 }
- 
-const logInfo = (...a) => console.log('ℹ️', ...a);
-const logStep = (...a) => console.log('▶️', ...a);
-const logSuccess = (...a) => console.log('✅', ...a);
-const logWarn = (...a) => console.warn('⚠️', ...a);
-const logError = (...a) => console.error('❌', ...a);
+
+function initLogger(logFilePath) {
+    const resolvedPath = path.resolve(logFilePath || 'downloader.log');
+    try { fs.mkdirSync(path.dirname(resolvedPath), { recursive: true }); } catch {}
+    LOG_WRITER = {
+        path: resolvedPath,
+        write(level, message) {
+            try {
+                const stamp = new Date().toISOString();
+                fs.appendFileSync(this.path, `[${stamp}] [${level}] ${message}\n`, 'utf8');
+            } catch {}
+        }
+    };
+    return LOG_WRITER;
+}
+
+function writeLog(level, ...parts) {
+    if (!LOG_WRITER) return;
+    LOG_WRITER.write(level, formatLogMessage(parts));
+}
+
+const logInfo = (...a) => { console.log('ℹ️', ...a); writeLog('INFO', ...a); };
+const logStep = (...a) => { console.log('▶️', ...a); writeLog('STEP', ...a); };
+const logSuccess = (...a) => { console.log('✅', ...a); writeLog('SUCCESS', ...a); };
+const logWarn = (...a) => { console.warn('⚠️', ...a); writeLog('WARN', ...a); };
+const logError = (...a) => { console.error('❌', ...a); writeLog('ERROR', ...a); };
 
 // ===============
-// Configuration
+// Configuration & State
 // ===============
 const COOKIE = (() => {
     if (process.env.MK_COOKIE && process.env.MK_COOKIE.trim()) return process.env.MK_COOKIE.trim();
     if (process.env.MK_COOKIE_FILE) {
-        try { return fs.readFileSync(process.env.MK_COOKIE_FILE, 'utf8').trim(); } catch { }
+        try { return fs.readFileSync(process.env.MK_COOKIE_FILE, 'utf8').trim(); } catch {}
     }
     return 'PUT_YOUR_COOKIE_HERE';
 })();
+
 let ACTIVE_COOKIE = null;
-const DEFAULT_SAMPLE_BYTES = 0;
 const ORIGIN = 'https://maktabkhooneh.org';
+
+function getCsrfToken() {
+    const ck = ACTIVE_COOKIE || COOKIE || '';
+    const m = ck.match(/csrftoken=([^;]+)/);
+    return m ? m[1] : '';
+}
 
 function commonHeaders(referer) {
     const headers = {
-        'accept': '*/*',
+        'accept': 'application/json, text/html, */*',
         'accept-language': 'en-US,en;q=0.9,fa;q=0.8',
         'cache-control': 'no-cache',
         'pragma': 'no-cache',
@@ -60,12 +92,14 @@ function commonHeaders(referer) {
     };
     const ck = ACTIVE_COOKIE || COOKIE;
     if (ck && ck !== 'PUT_YOUR_COOKIE_HERE') headers['cookie'] = ck;
+    const csrf = getCsrfToken();
+    if (csrf) headers['x-csrftoken'] = csrf;
     if (referer) headers['referer'] = referer;
     return headers;
 }
 
 function formatBytes(bytes) {
-    if (bytes == null || isNaN(bytes)) return '-';
+    if (bytes == null || isNaN(bytes) || bytes === 0) return '-';
     const units = ['B', 'KB', 'MB', 'GB', 'TB'];
     let i = 0; let n = Number(bytes);
     while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
@@ -81,154 +115,7 @@ function buildProgressBar(ratio, width = 24) {
     const r = Math.max(0, Math.min(1, ratio || 0));
     const filled = Math.round(r * width);
     const left = width - filled;
-    const bar = `${'█'.repeat(filled)}${'░'.repeat(left)}`;
-    return bar;
-}
-
-function ensureCookiePresent() {
-    if (!(ACTIVE_COOKIE && ACTIVE_COOKIE !== 'PUT_YOUR_COOKIE_HERE') && !(COOKIE && COOKIE !== 'PUT_YOUR_COOKIE_HERE')) {
-        logError('No active session. Provide credentials in user.txt or via --user / --pass.');
-        process.exit(1);
-    }
-}
-
-function printUsage() {
-    console.log(`${paintBoldCyan('Maktabkhooneh Downloader')} - ${paintYellow('version 1.2.0')} ${paint(COLOR.dim, '© 2025')}`);
-    console.log(paint(COLOR.dim, '=============================================================\n'));
-    console.log(paintBold('Required Files (next to the .exe):'));
-    console.log(`  ${paintYellow('link.txt')}                    Contains one course URL per line.`);
-    console.log(`  ${paintYellow('user.txt')}                    Contains email on the first line and password on the second.`);
-}
-
-function parseCLI() {
-    const args = process.argv.slice(2);
-    let sampleBytesToDownload = DEFAULT_SAMPLE_BYTES;
-    let isVerboseLoggingEnabled = false;
-    let userEmail = null;
-    let userPassword = null;
-    let sessionFile = 'session.json';
-    let forceLogin = false;
-    for (let i = 0; i < args.length; i++) {
-        const a = args[i];
-        if (a === '--user' || a === '--email') {
-            const v = args[i + 1]; if (v) { userEmail = v; i++; }
-        } else if (a.startsWith('--user=')) {
-            userEmail = a.split('=')[1];
-        } else if (a === '--pass' || a === '--password') {
-            const v = args[i + 1]; if (v) { userPassword = v; i++; }
-        } else if (a.startsWith('--pass=')) {
-            userPassword = a.split('=')[1];
-        } else if (a === '--session-file') {
-            const v = args[i + 1]; if (v) { sessionFile = v; i++; }
-        } else if (a.startsWith('--session-file=')) {
-            sessionFile = a.split('=')[1];
-        } else if (a.startsWith('--sample-bytes=')) {
-            const v = a.split('=')[1];
-            sampleBytesToDownload = parseInt(v, 10) || 0;
-        } else if (a === '--sample-bytes') {
-            const v = args[i + 1];
-            if (v) { sampleBytesToDownload = parseInt(v, 10) || 0; i++; }
-        } else if (a === '--verbose' || a === '-v') {
-            isVerboseLoggingEnabled = true;
-        } else if (a === '--force-login') {
-            forceLogin = true;
-        }
-    }
-    if (!sampleBytesToDownload && process.env.MK_SAMPLE_BYTES) {
-        sampleBytesToDownload = parseInt(process.env.MK_SAMPLE_BYTES, 10) || 0;
-    }
-    return { sampleBytesToDownload, isVerboseLoggingEnabled, userEmail, userPassword, sessionFile, forceLogin };
-}
-
-function createVerboseLogger(isVerbose) {
-    return { verbose: (...a) => { if (isVerbose) console.log(...a); } };
-}
-
-function extractCourseSlug(courseUrl) {
-    try {
-        const parsed = new URL(courseUrl);
-        if (parsed.origin !== ORIGIN) {
-            throw new Error('Unexpected origin: ' + parsed.origin);
-        }
-        const parts = parsed.pathname.split('/').filter(Boolean);
-        const idx = parts.indexOf('course');
-        if (idx === -1 || !parts[idx + 1]) throw new Error('Cannot parse course slug');
-        return parts[idx + 1];
-    } catch (e) {
-        throw new Error('Invalid course URL: ' + e.message);
-    }
-}
-
-async function fetchWithTimeout(url, options = {}, timeoutMs = 60_000) {
-    const controller = new AbortController();
-    const t = setTimeout(() => controller.abort(), timeoutMs);
-    try {
-        // node-fetch v2 AbortController signal support
-        options.signal = controller.signal;
-        const res = await fetch(url, options);
-        return res;
-    } finally {
-        clearTimeout(t);
-    }
-}
-
-function ensureTrailingSlash(u) { return u.endsWith('/') ? u : u + '/'; }
-
-async function getRemoteSizeAndRanges(url, referer) {
-    try {
-        const res = await fetchWithTimeout(url, { method: 'HEAD', headers: { ...commonHeaders(referer), accept: '*/*' } }, 60_000);
-        if (res.ok) {
-            const len = res.headers.get('content-length');
-            const size = len ? parseInt(len, 10) : undefined;
-            const acceptRanges = (res.headers.get('accept-ranges') || '').toLowerCase().includes('bytes');
-            return { size, acceptRanges };
-        }
-    } catch { }
-    try {
-        const res = await fetchWithTimeout(url, { method: 'GET', headers: { ...commonHeaders(referer), range: 'bytes=0-0', accept: '*/*' } }, 60_000);
-        if (res.status === 206) {
-            const cr = res.headers.get('content-range');
-            const m = cr && cr.match(/\/(\d+)$/);
-            const size = m ? parseInt(m[1], 10) : undefined;
-            try { if (res.body) { res.body.resume(); } } catch { }
-            return { size, acceptRanges: true };
-        }
-    } catch { }
-    return { size: undefined, acceptRanges: false };
-}
-
-async function fetchChapters(courseSlug, referer) {
-    const apiUrl = `${ORIGIN}/api/v1/courses/${courseSlug}/chapters/`;
-    const res = await fetchWithTimeout(apiUrl, { method: 'GET', headers: { ...commonHeaders(referer), accept: 'application/json' } });
-    if (!res.ok) throw new Error(`Failed to fetch chapters: ${res.status} ${res.statusText}`);
-    return res.json();
-}
-
-async function fetchCoreData(referer) {
-    const url = `${ORIGIN}/api/v1/general/core-data/?profile=1`;
-    const res = await fetchWithTimeout(url, { method: 'GET', headers: { ...commonHeaders(referer || ORIGIN), accept: 'application/json' } }, 30_000);
-    if (!res.ok) throw new Error(`Core-data request failed: ${res.status} ${res.statusText}`);
-    return res.json();
-}
-
-function printProfileSummary(core) {
-    const isAuthenticated = !!core?.auth?.details?.is_authenticated;
-    const email = core?.auth?.details?.email || core?.profile?.details?.email || '-';
-    const userId = core?.auth?.details?.user_id ?? '-';
-    const studentId = core?.auth?.details?.student_id ?? '-';
-    const hasSubscription = !!core?.auth?.conditions?.has_subscription;
-    const hasCoursePurchase = !!core?.auth?.conditions?.has_course_purchase;
-    const statusText = isAuthenticated ? paintGreen('Authenticated') : paintRed('NOT authenticated');
-    console.log(`🔐 Auth check: ${statusText}`);
-    console.log(`👤 User: ${paintCyan(email)}  | user_id: ${paintCyan(userId)}  | student_id: ${paintCyan(studentId)}`);
-    console.log(`💳 Subscription: ${hasSubscription ? paintGreen('yes') : paintYellow('no')}  | Has course purchase: ${hasCoursePurchase ? paintGreen('yes') : paintYellow('no')}`);
-    return isAuthenticated;
-}
-
-function buildLectureUrl(courseSlug, chapter, unit) {
-    const chapterSegment = `${encodeURIComponent(chapter.slug)}-ch${chapter.id}`;
-    const unitSegment = encodeURIComponent(unit.slug);
-    return `${ORIGIN}/course/${courseSlug}/${chapterSegment}/${unitSegment}/`;
+    return `${'█'.repeat(filled)}${'░'.repeat(left)}`;
 }
 
 function decodeHtmlEntities(str) {
@@ -239,50 +126,156 @@ function decodeHtmlEntities(str) {
         .replace(/&gt;/g, '>')
         .replace(/&quot;/g, '"')
         .replace(/&#39;|&apos;/g, "'")
+        .replace(/&nbsp;/g, ' ')
+        .replace(/&zwnj;/g, '\u200c')
         .replace(/&#(\d+);/g, (_, d) => String.fromCharCode(parseInt(d, 10)))
         .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCharCode(parseInt(h, 16)));
 }
 
-function extractVideoSources(html) {
-    const urls = [];
-    const re = /<source\b[^>]*?src=["']([^"'>]+)["'][^>]*>/gim;
-    let m;
-    while ((m = re.exec(html)) !== null) {
-        const raw = m[1];
-        const url = decodeHtmlEntities(raw);
-        if (url && url.includes('/videos/')) urls.push(url);
-    }
-    return Array.from(new Set(urls));
-}
-
-function pickBestSource(urls) {
-    if (!urls || urls.length === 0) return null;
-    const hq = urls.find(u => /\/videos\/hq\d+/.test(u) || u.includes('/videos/hq'));
-    return hq || urls[0];
-}
-
 function sanitizeName(name) {
-    return name.replace(/[\/:*?"<>|]/g, ' ').replace(/[\s\u200c\u200f\u202a\u202b]+/g, ' ').trim().slice(0, 150);
+    return (name || '')
+        .replace(/[\/:*?"<>|]/g, ' ')
+        .replace(/[\s\u200c\u200f\u202a\u202b]+/g, ' ')
+        .trim()
+        .slice(0, 150);
 }
 
-function extractAttachmentLinks(html) {
-    const results = new Set();
-    if (!html) return [];
-    const blockRe = /<div[^>]*class=["'][^"'>]*unit-content--download[^"'>]*["'][^>]*>[\s\S]*?<\/div>/gim;
-    let m;
-    while ((m = blockRe.exec(html)) !== null) {
-        const block = m[0];
-        const aRe = /<a[^>]+href=["']([^"'>]+)["'][^>]*>/gim;
-        let a;
-        while ((a = aRe.exec(block)) !== null) {
-            const raw = a[1];
-            const url = decodeHtmlEntities(raw);
-            if (url && /attachments/i.test(url)) {
-                results.add(url);
+function ensureTrailingSlash(u) {
+    return u.endsWith('/') ? u : u + '/';
+}
+
+function printUsage() {
+    console.log(`${paintBoldCyan('Maktabkhooneh Downloader PLUS')} - ${paintYellow('version 1.3.0')} ${paint(COLOR.dim, '© 2026')}`);
+    console.log(paint(COLOR.magenta, 'ویژگی‌ها: ') + 'دانلود ویدیوهای باکیفیت (1080p/720p)، زیرنویس‌ها، ضمائم و استخراج کوییزها به Markdown');
+    console.log(paint(COLOR.dim, '=============================================================\n'));
+    console.log(paintBold('Usage:'));
+    console.log(`  ${paintYellow('node Downloaderv1.3.js --user you@example.com --pass "password"')}`);
+    console.log(`  ${paintYellow('node Downloaderv1.3.js --cookie-file cookies.txt')}`);
+    console.log(`  ${paintYellow('node Downloaderv1.3.js --info')} ${paint(COLOR.dim, '(فقط نمایش سرفصل‌ها و حجم ویدیوها بدون دانلود)')}`);
+    console.log(`  ${paintYellow('node Downloaderv1.3.js --sample-bytes=1048576 --verbose')}`);
+    console.log(`  ${paintYellow('MK_COOKIE=your_cookie node Downloaderv1.3.js')}`);
+    console.log(paintBold('\nOptions:'));
+    console.log(`  ${paintYellow('--help, -h')}              نمایش راهنما`);
+    console.log(`  ${paintYellow('--info, --table')}          فقط نمایش فهرست دروس و حجم‌ها بدون دانلود`);
+    console.log(`  ${paintYellow('--user, --email')}         ایمیل ورود به سایت`);
+    console.log(`  ${paintYellow('--pass, --password')}      رمز عبور`);
+    console.log(`  ${paintYellow('--cookie-file')}          مسیر فایل Netscape cookies.txt`);
+    console.log(`  ${paintYellow('--session-file')}          مسیر ذخیره نشست (پیش‌فرض session.json)`);
+    console.log(`  ${paintYellow('--log-file')}              مسیر لاگ فایل (پیش‌فرض downloader.log)`);
+    console.log(`  ${paintYellow('--sample-bytes')}          دانلود فقط N بایت اول برای تست`);
+    console.log(`  ${paintYellow('--verbose, -v')}           نمایش جزییات لاگ‌ها`);
+    console.log(`  ${paintYellow('--force-login')}           اجبار به لاگین مجدد و نادیده گرفتن نشست قبلی`);
+    console.log(paintBold('\nFiles:'));
+    console.log(`  ${paintYellow('link.txt')}                لیست لینک دوره‌ها (هر سطر یک دوره)`);
+    console.log(`  ${paintYellow('user.txt')}                ایمیل در خط اول و پسورد در خط دوم`);
+}
+
+function parseCLI() {
+    const args = process.argv.slice(2);
+    let sampleBytesToDownload = 0;
+    let isVerboseLoggingEnabled = false;
+    let userEmail = null;
+    let userPassword = null;
+    let sessionFile = 'session.json';
+    let logFile = 'downloader.log';
+    let cookieFile = null;
+    let forceLogin = false;
+    let showHelp = false;
+    let isInfoMode = false;
+    
+    for (let i = 0; i < args.length; i++) {
+        const a = args[i];
+        if (a === '--user' || a === '--email') { const v = args[i + 1]; if (v) { userEmail = v; i++; } }
+        else if (a.startsWith('--user=')) userEmail = a.split('=')[1];
+        else if (a === '--pass' || a === '--password') { const v = args[i + 1]; if (v) { userPassword = v; i++; } }
+        else if (a.startsWith('--pass=')) userPassword = a.split('=')[1];
+        else if (a === '--session-file') { const v = args[i + 1]; if (v) { sessionFile = v; i++; } }
+        else if (a.startsWith('--session-file=')) sessionFile = a.split('=')[1];
+        else if (a === '--cookie-file') { const v = args[i + 1]; if (v) { cookieFile = v; i++; } }
+        else if (a.startsWith('--cookie-file=')) cookieFile = a.split('=')[1];
+        else if (a === '--log-file') { const v = args[i + 1]; if (v) { logFile = v; i++; } }
+        else if (a.startsWith('--log-file=')) logFile = a.split('=')[1];
+        else if (a.startsWith('--sample-bytes=')) sampleBytesToDownload = parseInt(a.split('=')[1], 10) || 0;
+        else if (a === '--sample-bytes') { const v = args[i + 1]; if (v) { sampleBytesToDownload = parseInt(v, 10) || 0; i++; } }
+        else if (a === '--verbose' || a === '-v') isVerboseLoggingEnabled = true;
+        else if (a === '--force-login') forceLogin = true;
+        else if (a === '--info' || a === '--table' || a === '--no-download') isInfoMode = true;
+        else if (a === '--help' || a === '-h') showHelp = true;
+    }
+
+    if (!sampleBytesToDownload && process.env.MK_SAMPLE_BYTES) {
+        sampleBytesToDownload = parseInt(process.env.MK_SAMPLE_BYTES, 10) || 0;
+    }
+
+    return { sampleBytesToDownload, isVerboseLoggingEnabled, userEmail, userPassword, sessionFile, logFile, cookieFile, forceLogin, showHelp, isInfoMode };
+}
+
+function createVerboseLogger(isVerbose) {
+    return { verbose: (...a) => { if (isVerbose) console.log(...a); } };
+}
+
+function extractCourseSlug(courseUrl) {
+    try {
+        const parsed = new URL(courseUrl);
+        const parts = parsed.pathname.split('/').filter(Boolean);
+        const idx = parts.indexOf('course');
+        if (idx === -1 || !parts[idx + 1]) throw new Error('Cannot parse course slug');
+        return parts[idx + 1];
+    } catch (e) { throw new Error('Invalid course URL: ' + e.message); }
+}
+
+function extractCourseSlugId(courseSlug) {
+    const match = courseSlug.match(/mk(\d+)/i) || courseSlug.match(/(\d+)$/);
+    return match ? match[1] : courseSlug;
+}
+
+function extractRequestedUnitId(courseUrl) {
+    try {
+        const parsed = new URL(courseUrl);
+        const parts = parsed.pathname.split('/').filter(Boolean);
+        const idx = parts.indexOf('unit');
+        if (idx !== -1 && parts[idx + 1] && /^\d+$/.test(parts[idx + 1])) {
+            return Number(parts[idx + 1]);
+        }
+    } catch {}
+    return null;
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = 60000) {
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        options.signal = controller.signal;
+        return await fetch(url, options);
+    } finally {
+        clearTimeout(t);
+    }
+}
+
+// ===============
+// Authentication & Multi-Session Helpers
+// ===============
+
+function parseNetscapeCookieFile(filePath) {
+    try {
+        if (!fs.existsSync(filePath)) return null;
+        const content = fs.readFileSync(filePath, 'utf8');
+        const lines = content.split('\n');
+        const cookies = {};
+        for (const line of lines) {
+            if (!line || line.startsWith('#')) continue;
+            const parts = line.split('\t');
+            if (parts.length >= 7) {
+                const name = parts[5].trim();
+                const value = parts[6].trim();
+                if (name && value) cookies[name] = value;
             }
         }
-    }
-    return Array.from(results);
+        if (cookies['sessionid'] || cookies['csrftoken']) {
+            return Object.entries(cookies).map(([k, v]) => `${k}=${v}`).join('; ');
+        }
+    } catch {}
+    return null;
 }
 
 async function readSessionFile(file) {
@@ -296,7 +289,7 @@ async function readSessionFile(file) {
                 lastUsed: 'default'
             };
         }
-    } catch { }
+    } catch {}
     return null;
 }
 
@@ -305,7 +298,7 @@ async function writeSessionFileMulti(file, email, cookie, existing) {
     let data = existing && existing.users ? existing : { users: {}, lastUsed: key };
     data.users[key] = { cookie, updated: new Date().toISOString() };
     data.lastUsed = key;
-    try { await fs.promises.writeFile(file, JSON.stringify(data, null, 2), 'utf8'); } catch { }
+    try { await fs.promises.writeFile(file, JSON.stringify(data, null, 2), 'utf8'); } catch {}
 }
 
 class SimpleCookieStore {
@@ -345,11 +338,12 @@ function rawRequest(urlStr, { method = 'GET', headers = {}, body = null } = {}) 
     });
 }
 
-async function loginWithCredentialsInline(email, password, verbose = () => { }) {
+async function loginWithCredentialsInline(email, password, verbose = () => {}) {
     if (!email || !password) throw new Error('Email & password required for login');
     const store = new SimpleCookieStore();
     const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36';
     const dbg = (...a) => verbose('[login]', ...a);
+
     let r = await rawRequest(`${ORIGIN}/accounts/login/`, {
         method: 'GET', headers: { 'User-Agent': UA, 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' }
     });
@@ -360,7 +354,7 @@ async function loginWithCredentialsInline(email, password, verbose = () => { }) 
             method: 'GET', headers: { 'User-Agent': UA, 'Accept': 'application/json' }
         });
         store.applySetCookie(r2.headers['set-cookie']);
-        try { const j2 = JSON.parse(r2.body); csrf = csrf || j2?.auth?.csrf || null; } catch { }
+        try { const j2 = JSON.parse(r2.body); csrf = csrf || j2?.auth?.csrf || null; } catch {}
         if (!csrf) csrf = store.get('csrftoken') || null;
     }
     if (!csrf) throw new Error('Cannot obtain CSRF token');
@@ -379,7 +373,7 @@ async function loginWithCredentialsInline(email, password, verbose = () => { }) 
         body: formCheck.toString()
     });
     store.applySetCookie(r.headers['set-cookie']);
-    let jCheck = null; try { jCheck = JSON.parse(r.body); } catch { }
+    let jCheck = null; try { jCheck = JSON.parse(r.body); } catch {}
     if (!jCheck || jCheck.status !== 'success' || jCheck.message !== 'get-pass') {
         throw new Error('Login flow step 1 failed: ' + (jCheck?.message || 'Unknown error'));
     }
@@ -396,40 +390,60 @@ async function loginWithCredentialsInline(email, password, verbose = () => { }) 
         body: formLogin.toString()
     });
     store.applySetCookie(r.headers['set-cookie']);
-    let jLogin = null; try { jLogin = JSON.parse(r.body); } catch { }
+    let jLogin = null; try { jLogin = JSON.parse(r.body); } catch {}
     if (!jLogin || jLogin.status !== 'success') throw new Error('Login failed: ' + (jLogin?.message || 'Invalid credentials'));
 
     const sessionid = store.get('sessionid');
-    const csrftoken = store.get('csrftoken') || csrf;
+    const csrftoken2 = store.get('csrftoken') || csrf;
     if (!sessionid) throw new Error('Session cookie missing after login');
-    ACTIVE_COOKIE = `csrftoken=${csrftoken}; sessionid=${sessionid}`;
+    ACTIVE_COOKIE = `csrftoken=${csrftoken2}; sessionid=${sessionid}`;
     return true;
 }
 
-async function prepareSession({ userEmail, userPassword, sessionFile, verbose, forceLogin }) {
+async function prepareSession({ userEmail, userPassword, sessionFile, cookieFile, verbose, forceLogin }) {
     const verify = async () => {
         try {
             if (!ACTIVE_COOKIE) return null;
-            verbose('Verifying existing session cookie...');
+            verbose('Verifying session cookie...');
             const core = await fetchCoreData(ORIGIN);
             const ok = !!core?.auth?.details?.is_authenticated;
             if (ok) {
                 logInfo('Session valid' + (userEmail ? ` (user: ${userEmail})` : ''));
                 return core;
             }
-            logWarn('Stored session not authenticated');
+            logWarn('Session not authenticated');
             return null;
         } catch (e) {
             verbose('Verify failed: ' + e.message);
             return null;
         }
     };
+
+    // Strategy 1: Explicit Netscape cookies.txt file
+    const txtCookie = cookieFile || (fs.existsSync('cookies.txt') ? 'cookies.txt' : null) || (fs.existsSync('maktabkhooneh.org_cookies.txt') ? 'maktabkhooneh.org_cookies.txt' : null);
+    if (txtCookie) {
+        const parsed = parseNetscapeCookieFile(txtCookie);
+        if (parsed) {
+            ACTIVE_COOKIE = parsed;
+            verbose(`Checking cookie from: ${txtCookie}`);
+            const core = await verify();
+            if (core) {
+                logSuccess(`Loaded active session from: ${txtCookie}`);
+                return { core, source: 'cookie-file' };
+            }
+            ACTIVE_COOKIE = null;
+        }
+    }
+
+    // Strategy 2: Environment variable override
     if (COOKIE && COOKIE !== 'PUT_YOUR_COOKIE_HERE') {
         ACTIVE_COOKIE = COOKIE;
         verbose('Using cookie from env / file override');
         const core = await verify();
         if (core) return { core, source: 'env' };
     }
+
+    // Strategy 3: Multi-user session.json file
     let sessionData = null;
     if (sessionFile) {
         sessionData = await readSessionFile(sessionFile);
@@ -449,6 +463,20 @@ async function prepareSession({ userEmail, userPassword, sessionFile, verbose, f
             ACTIVE_COOKIE = null;
         }
     }
+    if (!desiredUserKey && sessionData && sessionData.lastUsed && !forceLogin) {
+        const storedKey = sessionData.lastUsed;
+        const entry = sessionData.users[storedKey];
+        if (entry && entry.cookie) {
+            ACTIVE_COOKIE = entry.cookie;
+            logStep(`Loaded last-used stored session for ${storedKey}`);
+            const core = await verify();
+            if (core) return { core, source: 'stored-last-used' };
+            logWarn('Last-used stored session invalid; will attempt fresh login if credentials provided.');
+            ACTIVE_COOKIE = null;
+        }
+    }
+
+    // Strategy 4: Fresh credentials login
     if (desiredUserKey && userPassword && (!ACTIVE_COOKIE || forceLogin)) {
         try {
             logStep('Attempting login for ' + desiredUserKey);
@@ -460,14 +488,169 @@ async function prepareSession({ userEmail, userPassword, sessionFile, verbose, f
             const core = await verify();
             if (core) return { core, source: 'fresh-login' };
         } catch (e) {
-            logError('Login failed: ' + e.message);
-            process.exit(1);
+            logWarn('Login failed: ' + e.message + '. Proceeding with public/guest access.');
         }
     }
+
     if (!ACTIVE_COOKIE) {
-        logWarn('No usable session found. Provide credentials in user.txt or use --user and --pass to create one.');
+        logWarn('No usable session found. Provide credentials in user.txt or cookies in cookies.txt.');
     }
     return { core: null, source: 'none' };
+}
+
+// ===============
+// LMS API & Media Resolution
+// ===============
+
+async function fetchChapters(courseSlug, referer) {
+    const slugId = extractCourseSlugId(courseSlug);
+    const apiEndpoints = [
+        `${ORIGIN}/api/v1/lms/courses/${slugId}/outline/`,
+        `${ORIGIN}/api/v1/courses/${courseSlug}/chapters/`
+    ];
+
+    for (const apiUrl of apiEndpoints) {
+        try {
+            const res = await fetchWithTimeout(apiUrl, { method: 'GET', headers: { ...commonHeaders(referer), accept: 'application/json' } });
+            if (res.ok) {
+                const data = await res.json();
+                if (Array.isArray(data.chapters) && data.chapters.length > 0) return data;
+            }
+        } catch {}
+    }
+    throw new Error(`Failed to fetch chapters for: ${courseSlug}`);
+}
+
+async function fetchCoreData(referer) {
+    const url = `${ORIGIN}/api/v1/general/core-data/?profile=1`;
+    const res = await fetchWithTimeout(url, { method: 'GET', headers: { ...commonHeaders(referer || ORIGIN), accept: 'application/json' } }, 30000);
+    if (!res.ok) throw new Error(`Core-data request failed: ${res.status}`);
+    return res.json();
+}
+
+function printProfileSummary(core) {
+    const isAuthenticated = !!core?.auth?.details?.is_authenticated;
+    const email = core?.auth?.details?.email || core?.profile?.details?.email || '-';
+    const userId = core?.auth?.details?.user_id ?? '-';
+    const studentId = core?.auth?.details?.student_id ?? '-';
+    const hasSubscription = !!core?.auth?.conditions?.has_subscription || !!core?.auth?.conditions?.business_student;
+    const hasCoursePurchase = !!core?.auth?.conditions?.has_course_purchase;
+    const statusText = isAuthenticated ? paintGreen('Authenticated') : paintRed('NOT authenticated');
+    console.log(`🔐 Auth check: ${statusText}`);
+    console.log(`👤 User: ${paintCyan(email)}  | user_id: ${paintCyan(userId)}  | student_id: ${paintCyan(studentId)}`);
+    console.log(`💳 Subscription: ${hasSubscription ? paintGreen('yes') : paintYellow('no')}  | Has course purchase: ${hasCoursePurchase ? paintGreen('yes') : paintYellow('no')}`);
+    return isAuthenticated;
+}
+
+function buildLectureUrl(courseSlug, chapter, unit) {
+    if (unit && unit.id != null) {
+        return `${ORIGIN}/lms/course/${courseSlug}/unit/${unit.id}/`;
+    }
+    const chapterSlug = chapter?.slug ? encodeURIComponent(chapter.slug) : 'chapter';
+    const chapterId = chapter?.id ? `-ch${chapter.id}` : '';
+    const unitSlug = unit?.slug ? encodeURIComponent(unit.slug) : 'unit';
+    return `${ORIGIN}/course/${courseSlug}/${chapterSlug}${chapterId}/${unitSlug}/`;
+}
+
+async function fetchLmsUnitDetails(unitId, referer) {
+    if (!unitId) return { videoData: null, detailData: null };
+    const videoUrlApi = `${ORIGIN}/api/v1/lms/units/${unitId}/video_url/`;
+    const unitDetailApi = `${ORIGIN}/api/v1/lms/units/${unitId}/`;
+
+    let videoData = null;
+    let detailData = null;
+
+    try {
+        const res = await fetchWithTimeout(videoUrlApi, { method: 'GET', headers: { ...commonHeaders(referer), accept: 'application/json' } }, 15000);
+        if (res.ok) videoData = await res.json();
+    } catch {}
+
+    try {
+        const res = await fetchWithTimeout(unitDetailApi, { method: 'GET', headers: { ...commonHeaders(referer), accept: 'application/json' } }, 15000);
+        if (res.ok) detailData = await res.json();
+    } catch {}
+
+    return { videoData, detailData };
+}
+
+function extractLmsVideoUrls(videoData, detailData) {
+    const items = [];
+    const add = (url, quality = 'HQ') => {
+        if (!url) return;
+        const clean = decodeHtmlEntities(String(url).trim()).replace(/\\\//g, '/');
+        items.push({ url: clean, quality: String(quality) });
+    };
+
+    if (Array.isArray(videoData?.qualities)) {
+        for (const q of videoData.qualities) {
+            if (q.download_url) add(q.download_url, q.quality || q.label || 'HQ');
+        }
+    }
+    if (videoData?.video_urls) {
+        if (videoData.video_urls.hq) add(videoData.video_urls.hq, 'HQ');
+        if (videoData.video_urls.lq) add(videoData.video_urls.lq, 'LQ');
+    }
+    if (videoData?.hls?.master_url) add(videoData.hls.master_url, 'HLS Master');
+    if (Array.isArray(videoData?.hls?.qualities)) {
+        for (const q of videoData.hls.qualities) if (q.url) add(q.url, q.quality || 'HLS');
+    }
+
+    if (Array.isArray(detailData?.resources)) {
+        for (const r of detailData.resources) {
+            if (r.download_url) add(r.download_url, r.quality || r.title || 'HQ');
+        }
+    }
+
+    return items;
+}
+
+function pickBestLmsSource(videoItems) {
+    if (!videoItems || videoItems.length === 0) return null;
+    const mp4Items = videoItems.filter(v => /\.mp4(?:[?#]|$)/i.test(v.url));
+    const pool = mp4Items.length > 0 ? mp4Items : videoItems;
+
+    // Prioritize 1080p -> 720p -> 480p -> HQ
+    const p1080 = pool.find(v => /1080/i.test(v.quality) || /1080p/i.test(v.url));
+    if (p1080) return p1080.url;
+    const p720 = pool.find(v => /720/i.test(v.quality) || /720p/i.test(v.url) || /hq\d+/i.test(v.url));
+    if (p720) return p720.url;
+    const hq = pool.find(v => /hq/i.test(v.quality) || /hq/i.test(v.url));
+    if (hq) return hq.url;
+    const p480 = pool.find(v => /480/i.test(v.quality) || /480p/i.test(v.url));
+    if (p480) return p480.url;
+
+    return pool[0].url;
+}
+
+function extractVideoSourcesFromHtml(html) {
+    const urls = [];
+    const addCandidate = (raw) => {
+        if (!raw) return;
+        let url = decodeHtmlEntities(String(raw).trim())
+            .replace(/\\u002f/gi, '/')
+            .replace(/\\u0026/gi, '&')
+            .replace(/\\u003d/gi, '=')
+            .replace(/\\\//g, '/');
+        if (url.startsWith('//')) url = 'https:' + url;
+        try { url = new URL(url, ORIGIN).toString(); } catch {}
+
+        const lower = url.toLowerCase();
+        if (lower.includes('/videos/') || /\.(mp4|m3u8)(?:[?#]|$)/i.test(lower)) {
+            urls.push(url);
+        }
+    };
+
+    const attrRe = /\b(?:src|href|data-src|data-url|data-video|data-file|poster)=["']([^"']+)["']/gim;
+    let m;
+    while ((m = attrRe.exec(html)) !== null) addCandidate(m[1]);
+
+    const jsonValueRe = /["'](?:src|url|file|video|video_url|videoUrl|source|download_url)["']\s*:\s*["']([^"']+)["']/gim;
+    while ((m = jsonValueRe.exec(html)) !== null) addCandidate(m[1]);
+
+    const directUrlRe = /https?:\/\/[^\s"'<>\\]+(?:\.mp4|\.m3u8)(?:[^\s"'<>\\]*)?/gim;
+    while ((m = directUrlRe.exec(html)) !== null) addCandidate(m[0]);
+
+    return Array.from(new Set(urls));
 }
 
 function extractSubtitleLinks(html) {
@@ -483,37 +666,158 @@ function extractSubtitleLinks(html) {
     return Array.from(results);
 }
 
+function extractAttachmentLinks(html) {
+    const results = new Set();
+    if (!html) return [];
+    const blockRe = /<div[^>]*class=["'][^"'>]*unit-content--download[^"'>]*["'][^>]*>[\s\S]*?<\/div>/gim;
+    let m;
+    while ((m = blockRe.exec(html)) !== null) {
+        const block = m[0];
+        const aRe = /<a[^>]+href=["']([^"'>]+)["'][^>]*>/gim;
+        let a;
+        while ((a = aRe.exec(block)) !== null) {
+            const raw = a[1];
+            const url = decodeHtmlEntities(raw);
+            if (url && /attachments/i.test(url)) results.add(url);
+        }
+    }
+    return Array.from(results);
+}
+
+function convertHtmlToMarkdown(html, title) {
+    if (!html) return '';
+    let content = html;
+
+    content = content
+        .replace(/<head[^>]*>[\s\S]*?<\/head>/gi, '')
+        .replace(/<header[^>]*>[\s\S]*?<\/header>/gi, '')
+        .replace(/<nav[^>]*>[\s\S]*?<\/nav>/gi, '')
+        .replace(/<footer[^>]*>[\s\S]*?<\/footer>/gi, '')
+        .replace(/<aside[^>]*>[\s\S]*?<\/aside>/gi, '')
+        .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+        .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+        .replace(/<button[^>]*>[\s\S]*?<\/button>/gi, '')
+        .replace(/<(?:div|ol|ul)[^>]*class=["'][^"']*(?:breadcrumb|unit-breadcrumbs|course-breadcrumbs|unit-header|unit-content__header)[^"']*["'][^>]*>[\s\S]*?<\/(?:div|ol|ul)>/gi, '')
+        .replace(/<div[^>]*class=["'][^"']*(?:unit-navigation|unit-nav|next-prev)[^"']*["'][^>]*>[\s\S]*?<\/div>/gi, '');
+
+    const contentRegexes = [
+        /<div[^>]*class=["'][^"']*(?:unit-content__text|unit-content__body|reading-content|unit-content--reading|unit-content--text)[^"']*["'][^>]*>([\s\S]*?)<\/div>\s*<(?:div class="unit-content--download|div class="unit-navigation|footer|\/section|\/main)/i,
+        /<div[^>]*class=["'][^"']*(?:unit-content|unit-detail|unit-body|unit-reading|quiz-container)[^"']*["'][^>]*>([\s\S]*?)<\/div>\s*<(?:div class="course-curriculum|aside|footer|\/main)/i,
+        /<main[^>]*>([\s\S]*?)<\/main>/i
+    ];
+
+    for (const regex of contentRegexes) {
+        const match = content.match(regex);
+        if (match && match[1] && match[1].trim().length > 60) {
+            content = match[1];
+            break;
+        }
+    }
+
+    content = content.replace(/<(?:div|li|label)[^>]*class=["'][^"']*(?:answer|choice|option|quiz-item|choice-item)[^"']*["'][^>]*>([\s\S]*?)<\/(?:div|li|label)>/gi, (m, inner) => {
+        const clean = inner.replace(/<[^>]+>/g, ' ').trim();
+        return clean ? `\n- [ ] ${clean}\n` : '';
+    });
+    content = content.replace(/<input[^>]*type=["'](?:radio|checkbox)["'][^>]*>\s*(?:<label[^>]*>)?(.*?)(?:<\/label>)?/gi, '\n- [ ] $1\n');
+
+    content = content.replace(/<h([1-6])[^>]*>(.*?)<\/h\1>/gi, (_, level, text) => `\n\n${'#'.repeat(Number(level))} ${text.trim()}\n\n`);
+    content = content.replace(/<pre[^>]*><code[^>]*>([\s\S]*?)<\/code><\/pre>/gi, '\n```\n$1\n```\n\n');
+    content = content.replace(/<pre[^>]*>([\s\S]*?)<\/pre>/gi, '\n```\n$1\n```\n\n');
+    content = content.replace(/<code[^>]*>(.*?)<\/code>/gi, '`$1`');
+    content = content.replace(/<img[^>]*src=["']([^"'>]+)["'][^>]*alt=["']([^"'>]*)["'][^>]*>/gi, '![$2]($1)');
+    content = content.replace(/<img[^>]*src=["']([^"'>]+)["'][^>]*>/gi, '![]($1)');
+    content = content.replace(/<a[^>]*href=["']([^"'>]+)["'][^>]*>(.*?)<\/a>/gi, '[$2]($1)');
+    content = content.replace(/<p[^>]*>/gi, '\n\n').replace(/<\/p>/gi, '')
+        .replace(/<br\s*[\/]?>/gi, '\n')
+        .replace(/<li[^>]*>/gi, '\n- ').replace(/<\/li>/gi, '');
+    content = content.replace(/<(?:b|strong)[^>]*>(.*?)<\/(?:b|strong)>/gi, '**$1**')
+        .replace(/<(?:i|em)[^>]*>(.*?)<\/(?:i|em)>/gi, '*$1*');
+    content = content.replace(/<[^>]+>/g, ' ');
+    content = decodeHtmlEntities(content);
+
+    content = content.replace(/(?:^|\n)\s*(\d+)\s*\n+/g, '\n\n---\n\n### سوال $1\n\n');
+
+    const unwantedLines = new Set(['-', '- [ ]', 'نمایش', 'نمایش محتوای دوره', 'محتوای دوره', 'جلسه بعد', 'جلسه قبل']);
+    content = content
+        .split('\n')
+        .map(line => line.trim())
+        .filter(line => !unwantedLines.has(line))
+        .filter(line => !line.startsWith('نمره‌ی شما:') && !line.startsWith('%'))
+        .join('\n');
+
+    const escapedTitle = title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    content = content.replace(new RegExp(`^(?:#+\\s*)?${escapedTitle}\\s*`, 'i'), '').trim();
+
+    content = content
+        .replace(/[ \t\u200c]+/g, (match) => match.includes('\u200c') ? '\u200c' : ' ')
+        .replace(/\n\s*\n\s*\n+/g, '\n\n')
+        .trim();
+
+    return `# ${title}\n\n${content}\n\n---\n*Extracted by Maktabkhooneh Downloader PLUS*`;
+}
+
+// ===============
+// Streaming & Resumption Engine
+// ===============
+
 class ByteLimit extends Transform {
-    constructor(limit, onLimit) { super(); this.limit = limit; this.seen = 0; this._hit = false; this._onLimit = onLimit; }
+    constructor(limit, onLimit) { 
+        super(); 
+        this.limit = limit; 
+        this.seen = 0; 
+        this._hit = false; 
+        this._onLimit = onLimit; 
+    }
     _transform(chunk, enc, cb) {
         if (this.limit <= 0) { this.push(chunk); return cb(); }
         const remaining = this.limit - this.seen;
-        if (remaining <= 0) { return cb(); }
+        if (remaining <= 0) return cb();
         const buf = chunk.length > remaining ? chunk.subarray(0, remaining) : chunk;
         this.push(buf);
         this.seen += buf.length;
         if (!this._hit && this.seen >= this.limit) {
             this.end();
             this._hit = true;
-            if (typeof this._onLimit === 'function') { try { this._onLimit(); } catch { } }
+            if (typeof this._onLimit === 'function') try { this._onLimit(); } catch {}
         }
         cb();
     }
 }
 
+async function getRemoteSizeAndRanges(url, referer) {
+    try {
+        const res = await fetchWithTimeout(url, { method: 'HEAD', headers: { ...commonHeaders(referer), accept: '*/*' } }, 15000);
+        if (res.ok) {
+            const len = res.headers.get('content-length');
+            const size = len ? parseInt(len, 10) : undefined;
+            const acceptRanges = (res.headers.get('accept-ranges') || '').toLowerCase().includes('bytes');
+            return { size, acceptRanges };
+        }
+    } catch {}
+    try {
+        const res = await fetchWithTimeout(url, { method: 'GET', headers: { ...commonHeaders(referer), range: 'bytes=0-0', accept: '*/*' } }, 15000);
+        if (res.status === 206) {
+            const cr = res.headers.get('content-range');
+            const m = cr && cr.match(/\/(\d+)$/);
+            const size = m ? parseInt(m[1], 10) : undefined;
+            try { if (res.body) { const rb = typeof res.body.pipe === 'function' ? res.body : Readable.fromWeb(res.body); rb.resume(); } } catch {}
+            return { size, acceptRanges: true };
+        }
+    } catch {}
+    return { size: undefined, acceptRanges: false };
+}
+
 async function downloadToFile(url, filePath, referer, maxRetries = 3, sampleBytes = 0, label = '') {
     let existingFinalSize = 0;
-    try { const stat = fs.statSync(filePath); existingFinalSize = stat.size; if (existingFinalSize > 0 && sampleBytes > 0) return 'exists'; } catch { }
+    try { existingFinalSize = fs.statSync(filePath).size; if (existingFinalSize > 0 && sampleBytes > 0) return 'exists'; } catch {}
     const tmpPath = filePath + '.part';
     let existingTmpSize = 0;
-    try { const stat = fs.statSync(tmpPath); existingTmpSize = stat.size; } catch { }
-
+    try { existingTmpSize = fs.statSync(tmpPath).size; } catch {}
+    
     let remoteInfo;
     if (sampleBytes === 0 && existingFinalSize > 0) {
         remoteInfo = await getRemoteSizeAndRanges(url, referer);
-        if (remoteInfo.size && existingFinalSize >= remoteInfo.size) {
-            return 'exists';
-        }
+        if (remoteInfo.size && existingFinalSize >= remoteInfo.size) return 'exists';
     }
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -524,32 +828,31 @@ async function downloadToFile(url, filePath, referer, maxRetries = 3, sampleByte
                 else if (existingFinalSize > 0) {
                     if (!remoteInfo) remoteInfo = await getRemoteSizeAndRanges(url, referer);
                     if (remoteInfo.acceptRanges) {
-                        try { await fs.promises.rename(filePath, tmpPath); resumeOffset = existingFinalSize; } catch { }
+                        try { await fs.promises.rename(filePath, tmpPath); existingTmpSize = existingFinalSize; resumeOffset = existingFinalSize; existingFinalSize = 0; } catch {}
                     }
                 }
             }
             
             const requestInit = { method: 'GET', headers: { ...commonHeaders(referer), accept: 'video/mp4,application/octet-stream,*/*' } };
-            if (sampleBytes > 0) {
-                requestInit.headers['range'] = `bytes=0-${Math.max(0, sampleBytes - 1)}`;
-            } else if (resumeOffset > 0) {
-                requestInit.headers['range'] = `bytes=${resumeOffset}-`;
-            }
+            if (sampleBytes > 0) requestInit.headers['range'] = `bytes=0-${Math.max(0, sampleBytes - 1)}`;
+            else if (resumeOffset > 0) requestInit.headers['range'] = `bytes=${resumeOffset}-`;
 
-            const res = await fetchWithTimeout(url, requestInit, 600_000); // 10 minutes timeout
-            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const controller = new AbortController();
+            const to = setTimeout(() => controller.abort(), 1800000); // 30 mins per file chunk
+            const res = await fetch(url, { ...requestInit, signal: controller.signal });
+            if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+            
             if (resumeOffset > 0 && res.status !== 206) {
-                try { await fs.promises.unlink(tmpPath); } catch { }
-                resumeOffset = 0;
-                throw new Error('Server did not honor range; restarting from 0');
+                try { await fs.promises.unlink(tmpPath); } catch {}
+                existingTmpSize = 0; resumeOffset = 0;
+                clearTimeout(to);
+                throw new Error('Server rejected range request');
             }
 
             await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
-            const write = fs.createWriteStream(tmpPath, { flags: resumeOffset > 0 ? 'a' : 'w' });
+            const write = fs.createWriteStream(tmpPath, { flags: (sampleBytes > 0 || resumeOffset === 0) ? 'w' : 'a' });
+            const readable = typeof res.body.pipe === 'function' ? res.body : Readable.fromWeb(res.body);
             
-            // FIX: The body from node-fetch@2 is already a Node.js stream.
-            const readable = res.body;
-
             const contentLengthHeader = res.headers.get('content-length');
             const fullLength = contentLengthHeader ? parseInt(contentLengthHeader, 10) : undefined;
             let expectedTotal;
@@ -559,193 +862,374 @@ async function downloadToFile(url, filePath, referer, maxRetries = 3, sampleByte
             else if (crMatch) expectedTotal = parseInt(crMatch[1], 10);
             else if (fullLength && resumeOffset > 0) expectedTotal = resumeOffset + fullLength;
             else expectedTotal = fullLength;
+            
             let downloadedBytes = resumeOffset;
             const startedAt = Date.now();
 
             const render = (final = false) => {
                 const elapsedSec = Math.max(0.001, (Date.now() - startedAt) / 1000);
                 const speed = (downloadedBytes - resumeOffset) / elapsedSec;
-                let ratio = expectedTotal ? (downloadedBytes / expectedTotal) : 0;
-                if (final) ratio = 1;
-                const bar = buildProgressBar(ratio);
-                const pct = `${(Math.min(1, ratio) * 100).toFixed(1)}%`;
-                const sizeStr = `${formatBytes(downloadedBytes)}${expectedTotal ? ' / ' + formatBytes(expectedTotal) : ''}`;
-                const line = `  ⬇️  [${bar}] ${pct}  ${sizeStr}  ${formatSpeed(speed)}`;
-                process.stdout.write(`\r${line}`);
+                let shownDownloaded = downloadedBytes;
+                if (expectedTotal && (final || downloadedBytes > expectedTotal)) {
+                    if (downloadedBytes - expectedTotal <= 65536) shownDownloaded = expectedTotal;
+                }
+                const ratio = final ? 1 : (expectedTotal ? (shownDownloaded / expectedTotal) : 0);
+                const pct = final ? '100.0%' : (expectedTotal ? `${(Math.min(1, ratio) * 100).toFixed(1)}%` : '--%');
+                const name = label ? ` - ${label.slice(0, 50)}` : '';
+                process.stdout.write(`\r  ⬇️  [${buildProgressBar(final ? 1 : ratio)}] ${pct}  ${formatBytes(shownDownloaded)}${expectedTotal ? ' / ' + formatBytes(expectedTotal) : ''}  ${formatSpeed(speed)}${name}`);
             };
 
             const counter = new Transform({
-                transform(chunk, _enc, cb) {
+                transform(chunk, _, cb) {
                     downloadedBytes += chunk.length;
                     if (downloadedBytes === resumeOffset + chunk.length || downloadedBytes % 65536 < 8192) render();
                     cb(null, chunk);
                 }
             });
 
-            await pipeline(readable, counter, write);
+            let limitReached = false;
+            try {
+                if (sampleBytes > 0) {
+                    const limiter = new ByteLimit(sampleBytes, () => {
+                        limitReached = true;
+                        try { readable.destroy(new Error('byte-limit')); } catch {}
+                        try { controller.abort(); } catch {}
+                    });
+                    await pipeline(readable, counter, limiter, write);
+                } else {
+                    await pipeline(readable, counter, write);
+                }
+            } catch (pipeErr) {
+                if (sampleBytes > 0 && limitReached) {
+                    try { clearTimeout(to); } catch {}
+                    try { render(true); process.stdout.write('\n'); } catch {}
+                    try { await fs.promises.rename(tmpPath, filePath); } catch {}
+                    return 'downloaded';
+                }
+                throw pipeErr;
+            } finally {
+                clearTimeout(to);
+            }
 
             render(true);
             process.stdout.write('\n');
             await fs.promises.rename(tmpPath, filePath);
             return 'downloaded';
+            
         } catch (err) {
             process.stdout.write('\n');
-            if (attempt < maxRetries) {
-                logWarn(`Retry ${attempt}/${maxRetries} for ${path.basename(filePath)} after error: ${err.message}`);
-                await sleep(2000 * attempt);
-                continue;
+            if (attempt === maxRetries) {
+                try { await fs.promises.unlink(tmpPath); } catch {}
+                throw err;
             }
-            throw err;
+            logWarn(`Retry ${attempt}/${maxRetries} for ${path.basename(filePath)} | ${err.message}`);
+            await sleep(1500 * attempt);
         }
     }
 }
 
+// ===============
+// Main Execution Orchestrator
+// ===============
+
 async function main() {
     try {
         const cliArgs = parseCLI();
-        const { sampleBytesToDownload, isVerboseLoggingEnabled, sessionFile, forceLogin } = cliArgs;
+        const { sampleBytesToDownload, userEmail, userPassword, sessionFile, logFile, cookieFile, forceLogin, isVerboseLoggingEnabled, showHelp, isInfoMode } = cliArgs;
         const { verbose } = createVerboseLogger(isVerboseLoggingEnabled);
-
-        // FIX: Use path relative to the executable for robust file access
         const baseDir = process.pkg ? path.dirname(process.execPath) : __dirname;
+        const resolvedLogFile = path.resolve(baseDir, logFile || 'downloader.log');
+        initLogger(resolvedLogFile);
 
-        let userEmailFromFile = null, userPasswordFromFile = null;
-        try {
-            const userContent = fs.readFileSync(path.join(baseDir, 'user.txt'), 'utf8').trim().split(/\r?\n/);
-            if (userContent.length >= 2 && userContent[0].trim() && userContent[1].trim()) {
-                userEmailFromFile = userContent[0].trim();
-                userPasswordFromFile = userContent[1].trim();
-                logInfo('Credentials loaded from user.txt');
-            } else {
-                logWarn('user.txt is incomplete.');
-            }
-        } catch (e) {
-            logError("Could not read 'user.txt'. Make sure it's next to the executable.");
+        writeLog('INFO', 'Maktabkhooneh Downloader v1.3 started');
+        writeLog('INFO', `Working directory: ${baseDir}`);
+        writeLog('INFO', `Log file: ${resolvedLogFile}`);
+
+        if (showHelp) {
             printUsage();
-            await sleep(5000);
-            process.exit(1);
+            writeLog('INFO', 'Help requested');
+            process.exit(0);
         }
 
-        const userEmail = cliArgs.userEmail || userEmailFromFile;
-        const userPassword = cliArgs.userPassword || userPasswordFromFile;
+        let email = userEmail;
+        let password = userPassword;
+        if (!email || !password) {
+            try {
+                const userTxt = fs.readFileSync(path.join(baseDir, 'user.txt'), 'utf8');
+                const lines = userTxt.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+                if (!email && lines[0]) email = lines[0];
+                if (!password && lines[1]) password = lines[1];
+                writeLog('INFO', `Loaded credentials from user.txt for email: ${email || 'unknown'}`);
+            } catch {}
+        }
+
+        const sessionFilePath = path.resolve(baseDir, sessionFile || 'session.json');
+        const cookieFilePath = cookieFile ? path.resolve(baseDir, cookieFile) : null;
+
+        writeLog('INFO', `Preparing session for ${email || 'unknown user'}`);
+        const sessionResult = await prepareSession({ userEmail: email, userPassword: password, sessionFile: sessionFilePath, cookieFile: cookieFilePath, verbose, forceLogin });
+        
+        let coreData = sessionResult.core;
+        if (!coreData) {
+            try { coreData = await fetchCoreData(ORIGIN); } catch {}
+        }
+
+        if (coreData) {
+            printProfileSummary(coreData);
+        } else {
+            logWarn('No active session authenticated. Proceeding as guest/public access.');
+        }
 
         let courseUrls = [];
         try {
             const linkContent = fs.readFileSync(path.join(baseDir, 'link.txt'), 'utf8');
-            courseUrls = linkContent.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
-            if (courseUrls.length === 0) throw new Error('link.txt is empty.');
-            logInfo(`${courseUrls.length} course link(s) loaded from link.txt`);
-        } catch (e) {
-            logError("Could not read 'link.txt'. Make sure it's next to the executable and not empty.");
+            courseUrls = linkContent.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+            writeLog('INFO', `Loaded ${courseUrls.length} course URL(s) from link.txt`);
+            if (!courseUrls.length) throw new Error('Empty');
+        } catch {
+            logError("Failed to read valid links from 'link.txt'. Make sure link.txt exists next to the script.");
             printUsage();
-            await sleep(5000);
-            process.exit(1);
-        }
-        
-        const prep = await prepareSession({ userEmail, userPassword, sessionFile, verbose, forceLogin });
-        ensureCookiePresent();
-
-        let coreData = prep.core;
-        if (!coreData) {
-            coreData = await fetchCoreData(ORIGIN);
-        }
-        const ok = printProfileSummary(coreData);
-        if (!ok) {
-            logError('Authentication failed. Please check your credentials in user.txt.');
-            await sleep(5000);
             process.exit(1);
         }
 
         for (const courseUrl of courseUrls) {
             console.log('\n' + '═'.repeat(60));
-            logStep(`Processing course: ${paintBold(courseUrl)}`);
-            try {
-                const normalizedCourseUrl = ensureTrailingSlash(courseUrl.trim());
-                const courseSlug = extractCourseSlug(normalizedCourseUrl);
-                const courseDisplayName = sanitizeName(decodeURIComponent(courseSlug));
-                
-                // FIX: Save downloads relative to the executable's location
-                const outputRootFolder = path.resolve(baseDir, 'download', courseDisplayName);
-                
-                try { await fs.promises.mkdir(outputRootFolder, { recursive: true }); } catch { }
-
-                console.log(`📚 Course slug: ${paintBold(decodeURIComponent(courseSlug))}`);
-                console.log(`📁 Output folder: ${paintCyan(outputRootFolder)}`);
+            writeLog('INFO', `Processing course URL: ${courseUrl}`);
+            const normalizedCourseUrl = ensureTrailingSlash(courseUrl.trim());
+            const courseSlug = extractCourseSlug(normalizedCourseUrl);
+            const requestedUnitId = extractRequestedUnitId(normalizedCourseUrl);
+            const courseDisplayName = sanitizeName(decodeURIComponent(courseSlug));
+            const outputRoot = path.resolve(baseDir, 'download', courseDisplayName);
+            
+            if (isInfoMode) {
+                console.log(`\n🔍 ${paintBoldCyan('INFO MODE ACTIVATED:')} Fetching curriculum for ${paintBold(courseDisplayName)}...\n`);
+            } else {
+                logStep(`Processing: ${paintBold(courseDisplayName)}`);
+                try { await fs.promises.mkdir(outputRoot, { recursive: true }); } catch {}
                 if (sampleBytesToDownload > 0) {
                     console.log(`🎯 Sample mode: downloading first ${paintBold(String(sampleBytesToDownload))} bytes`);
                 }
+            }
 
-                const chaptersData = await fetchChapters(courseSlug, normalizedCourseUrl);
-                const chapters = Array.isArray(chaptersData?.chapters) ? chaptersData.chapters : [];
-                if (chapters.length === 0) {
-                    logError('No chapters found. Check the URL and your access rights.');
-                    continue;
-                }
+            let chaptersData;
+            try {
+                chaptersData = await fetchChapters(courseSlug, normalizedCourseUrl);
+            } catch (e) {
+                logError(`Failed to fetch chapters for ${courseSlug}: ${e.message}`);
+                writeLog('ERROR', `Failed to fetch chapters for ${courseSlug}: ${e.message}`);
+                continue;
+            }
+
+            const chapters = Array.isArray(chaptersData?.chapters) ? chaptersData.chapters : [];
+            let stats = { total: 0, downloaded: 0, skipped: 0, failed: 0, markdown: 0 };
+            let tableData = [];
+            let totalEstimatedSize = 0;
+
+            for (let cIdx = 0; cIdx < chapters.length; cIdx++) {
+                const chapter = chapters[cIdx];
+                const chapterFolder = path.join(outputRoot, `${String(cIdx + 1).padStart(2, '0')} - ${sanitizeName(chapter.title || chapter.slug || 'chapter')}`);
                 
-                let totalUnits = 0, downloadedCount = 0, skippedCount = 0, failedCount = 0;
-                for (let chapterIndex = 0; chapterIndex < chapters.length; chapterIndex++) {
-                    const chapter = chapters[chapterIndex];
-                    const chapterOrder = String(chapterIndex + 1).padStart(2, '0');
-                    const chapterFolder = path.join(outputRootFolder, `${chapterOrder} - ${sanitizeName(chapter.title || 'chapter')}`);
-                    console.log(`📖 Chapter ${chapterIndex + 1}/${chapters.length}: ${paintBold(chapter.title || chapter.slug)}`);
+                if (!isInfoMode) {
+                    console.log(`\n📖 Chapter ${cIdx + 1}/${chapters.length}: ${paintBold(chapter.title || chapter.slug)}`);
+                }
+                writeLog('INFO', `Chapter ${cIdx + 1}/${chapters.length}: ${chapter.title || chapter.slug || 'chapter'}`);
 
-                    const units = Array.isArray(chapter.unit_set) ? chapter.unit_set : [];
-                    for (let unitIndex = 0; unitIndex < units.length; unitIndex++) {
-                        const unit = units[unitIndex];
-                        if (!unit?.status || unit?.type !== 'lecture') continue;
-                        totalUnits++;
-                        const unitOrder = String(unitIndex + 1).padStart(2, '0');
-                        const baseFileName = `${unitOrder} - ${sanitizeName(unit.title || 'lecture')}.mp4`;
-                        const finalFileName = sampleBytesToDownload > 0 ? baseFileName.replace(/\.mp4$/i, '.sample.mp4') : baseFileName;
-                        const outputFilePath = path.join(chapterFolder, finalFileName);
+                const units = Array.isArray(chapter.units) ? chapter.units : (Array.isArray(chapter.unit_set) ? chapter.unit_set : []);
+                for (let uIdx = 0; uIdx < units.length; uIdx++) {
+                    const unit = units[uIdx];
+                    if ('status' in unit && !unit.status) continue;
+                    if (requestedUnitId != null && Number(unit?.id) !== requestedUnitId) continue;
 
-                        if (unit.locked) {
-                            logWarn(`🔒 Locked/No access: ${finalFileName}`);
-                            skippedCount++;
+                    stats.total++;
+                    const unitOrder = String(uIdx + 1).padStart(2, '0');
+                    const sanitizedTitle = sanitizeName(unit.title || unit.slug || 'lecture');
+                    const baseFileName = `${unitOrder} - ${sanitizedTitle}.mp4`;
+                    const finalFileName = sampleBytesToDownload > 0 ? baseFileName.replace(/\.mp4$/i, '.sample.mp4') : baseFileName;
+                    const videoBaseNoExt = finalFileName.replace(/\.sample\.mp4$/i, '').replace(/\.mp4$/i, '');
+                    const outputFilePath = path.join(chapterFolder, finalFileName);
+
+                    const isVideo = unit.type === 1 || unit.type === 'lecture' || /video/i.test(unit.type_display || '') || unit.type === 'video';
+                    const isLocked = unit.locked === true || (unit.view_access === 2 && !coreData?.auth?.conditions?.has_subscription && !coreData?.auth?.conditions?.business_student && !coreData?.auth?.conditions?.has_course_purchase);
+
+                    if (isLocked) {
+                        logWarn(`🔒 Locked/No access: ${finalFileName}`);
+                        writeLog('WARN', `Locked lecture skipped: ${finalFileName}`);
+                        stats.skipped++;
+                        if (isInfoMode) {
+                            tableData.push({ Chapter: (chapter.title || '').slice(0, 30), Lesson: (unit.title || '').slice(0, 45), Type: unit.type_display || 'Lesson', Size: 'Locked 🔒' });
+                        }
+                        continue;
+                    }
+
+                    const lectureUrl = buildLectureUrl(courseSlug, chapter, unit);
+                    try {
+                        // 1. Fetch LMS unit details & tokenized video URLs
+                        let bestVideo = null;
+                        let unitVideoData = null;
+                        let unitDetailData = null;
+
+                        if (unit?.id) {
+                            const lmsData = await fetchLmsUnitDetails(unit.id, lectureUrl);
+                            unitVideoData = lmsData.videoData;
+                            unitDetailData = lmsData.detailData;
+                            const lmsVideoUrls = extractLmsVideoUrls(unitVideoData, unitDetailData);
+                            bestVideo = pickBestLmsSource(lmsVideoUrls);
+                        }
+
+                        // 2. Fallback to HTML lecture page scraping if needed
+                        let html = '';
+                        if (!bestVideo) {
+                            try {
+                                const res = await fetchWithTimeout(lectureUrl, { headers: { ...commonHeaders(normalizedCourseUrl), accept: 'text/html' } }, 15000);
+                                if (res.ok) {
+                                    html = await res.text();
+                                    const htmlVideos = extractVideoSourcesFromHtml(html);
+                                    if (htmlVideos.length > 0) {
+                                        const htmlItems = htmlVideos.map(u => ({ url: u, quality: 'HQ' }));
+                                        bestVideo = pickBestLmsSource(htmlItems);
+                                    }
+                                }
+                            } catch {}
+                        }
+
+                        // 3. Handle Non-video units (quizzes / text readings / exercises)
+                        if (!isVideo || !bestVideo) {
+                            if (isInfoMode) {
+                                tableData.push({ Chapter: (chapter.title || '').slice(0, 30), Lesson: (unit.title || '').slice(0, 45), Type: unit.type_display || 'Text/Quiz', Size: 'N/A' });
+                                continue;
+                            }
+
+                            const mdFileName = `${unitOrder} - ${sanitizedTitle}.md`;
+                            const mdFilePath = path.join(chapterFolder, mdFileName);
+                            if (fs.existsSync(mdFilePath) && fs.statSync(mdFilePath).size > 0) {
+                                console.log(paintYellow(`🟡 SKIP exists: ${mdFileName}`));
+                                writeLog('INFO', `Skipped existing Markdown: ${mdFileName}`);
+                                stats.skipped++;
+                            } else {
+                                console.log(`📝 Extracting Markdown: ${mdFileName}`);
+                                writeLog('INFO', `Extracting Markdown: ${mdFileName}`);
+                                await fs.promises.mkdir(chapterFolder, { recursive: true });
+                                const rawText = unitDetailData?.description || unit.description || html || '';
+                                const mdContent = convertHtmlToMarkdown(rawText, unit.title || sanitizedTitle);
+                                await fs.promises.writeFile(mdFilePath, mdContent, 'utf8');
+                                logSuccess(`SAVED: ${mdFileName}`);
+                                writeLog('SUCCESS', `Saved Markdown: ${mdFileName}`);
+                                stats.markdown++;
+                            }
                             continue;
                         }
 
-                        const lectureUrl = buildLectureUrl(courseSlug, chapter, unit);
-                        try {
-                            const res = await fetchWithTimeout(lectureUrl, { headers: { ...commonHeaders(normalizedCourseUrl), accept: 'text/html' } });
-                            if (!res.ok) throw new Error(`HTTP ${res.status}`);
-                            const html = await res.text();
-                            const videoSources = extractVideoSources(html);
-                            const bestSourceUrl = pickBestSource(videoSources);
-                            if (!bestSourceUrl) { logWarn(`No video source found for: ${finalFileName}`); skippedCount++; continue; }
-
-                            console.log(`📥 Downloading: ${finalFileName}`);
-                            const status = await downloadToFile(bestSourceUrl, outputFilePath, lectureUrl, 3, sampleBytesToDownload, '');
-                            if (status === 'exists') { console.log(paintYellow(`🟡 SKIP exists: ${finalFileName}`)); skippedCount++; }
-                            else { logSuccess(`DOWNLOADED: ${finalFileName}`); downloadedCount++; }
-                            
-                            // Attachments & Subtitles can be added here if needed
-                            
-                            await sleep(400);
-                        } catch (err) {
-                            logError(`FAIL ${finalFileName}: ${err.message}`);
-                            failedCount++;
+                        // 4. Info table mode
+                        if (isInfoMode) {
+                            let sizeStr = 'Unknown';
+                            const { size } = await getRemoteSizeAndRanges(bestVideo, lectureUrl);
+                            if (size) { totalEstimatedSize += size; sizeStr = formatBytes(size); }
+                            tableData.push({ Chapter: (chapter.title || '').slice(0, 30), Lesson: (unit.title || '').slice(0, 45), Type: 'Video', Size: sizeStr });
+                            process.stdout.write(`Fetching info... ${tableData.length} items parsed.\r`);
+                            continue;
                         }
+
+                        // 5. Download video
+                        console.log(`📥 Downloading: ${finalFileName}`);
+                        writeLog('INFO', `Downloading: ${finalFileName} (URL: ${bestVideo})`);
+                        const status = await downloadToFile(bestVideo, outputFilePath, lectureUrl, 3, sampleBytesToDownload, finalFileName);
+                        if (status === 'exists') {
+                            console.log(paintYellow(`🟡 SKIP exists: ${finalFileName}`));
+                            writeLog('INFO', `Skipped existing file: ${finalFileName}`);
+                            stats.skipped++;
+                        } else {
+                            logSuccess(`DOWNLOADED: ${finalFileName}`);
+                            writeLog('SUCCESS', `Downloaded: ${finalFileName}`);
+                            stats.downloaded++;
+                        }
+
+                        // 6. Download Subtitles (.vtt)
+                        try {
+                            let subUrl = unitDetailData?.has_caption && unitDetailData?.caption_file ? unitDetailData.caption_file : null;
+                            if (!subUrl && html) {
+                                const subLinks = extractSubtitleLinks(html);
+                                if (subLinks.length > 0) subUrl = subLinks[0];
+                            }
+                            if (subUrl) {
+                                const absSubUrl = (() => { try { return new URL(subUrl, ORIGIN).toString(); } catch { return subUrl; } })();
+                                let ext = '.vtt';
+                                try { const up = new URL(absSubUrl); ext = path.extname(up.pathname) || '.vtt'; } catch {}
+                                const subtitleName = `${videoBaseNoExt}${ext}`;
+                                const subtitlePath = path.join(chapterFolder, subtitleName);
+                                if (!fs.existsSync(subtitlePath) || fs.statSync(subtitlePath).size === 0) {
+                                    console.log(`📝 Subtitle: ${subtitleName}`);
+                                    await downloadToFile(absSubUrl, subtitlePath, lectureUrl, 2, 0, subtitleName);
+                                    logSuccess(`SUBTITLE: ${subtitleName}`);
+                                    writeLog('SUCCESS', `Downloaded subtitle: ${subtitleName}`);
+                                }
+                            }
+                        } catch (subErr) {
+                            verbose(`Subtitle fail: ${subErr.message}`);
+                        }
+
+                        // 7. Download Attachments
+                        try {
+                            const attCandidates = new Set();
+                            if (unitDetailData?.description) {
+                                for (const a of extractAttachmentLinks(unitDetailData.description)) attCandidates.add(a);
+                            }
+                            if (html) {
+                                for (const a of extractAttachmentLinks(html)) attCandidates.add(a);
+                            }
+                            for (const attUrl of attCandidates) {
+                                let filePart;
+                                try {
+                                    const u = new URL(attUrl, ORIGIN);
+                                    filePart = u.pathname.split('/').pop() || 'attachment.bin';
+                                } catch {
+                                    filePart = attUrl.split('?')[0].split('/').pop() || 'attachment.bin';
+                                }
+                                const finalAttachmentName = `${videoBaseNoExt} - ${sanitizeName(filePart)}`;
+                                const attachmentPath = path.join(chapterFolder, finalAttachmentName);
+                                if (!fs.existsSync(attachmentPath) || fs.statSync(attachmentPath).size === 0) {
+                                    console.log(`📎 Attachment: ${finalAttachmentName}`);
+                                    await downloadToFile(attUrl, attachmentPath, lectureUrl, 3, 0, finalAttachmentName);
+                                    logSuccess(`ATTACHMENT: ${finalAttachmentName}`);
+                                    writeLog('SUCCESS', `Downloaded attachment: ${finalAttachmentName}`);
+                                }
+                            }
+                        } catch (attErr) {
+                            verbose(`Attachment fail: ${attErr.message}`);
+                        }
+
+                        await sleep(250);
+
+                    } catch (err) {
+                        logError(`FAIL ${finalFileName}: ${err.message}`);
+                        writeLog('ERROR', `Failed file: ${finalFileName} | ${err.message}`);
+                        stats.failed++;
                     }
                 }
+            }
+            
+            if (isInfoMode) {
+                console.log('\n\n' + '═'.repeat(95));
+                console.table(tableData);
+                console.log('═'.repeat(95));
+                console.log(`📊 Total Lessons: ${paintBold(tableData.length.toString())}`);
+                console.log(`💾 Estimated Video Size: ${paintCyan(formatBytes(totalEstimatedSize))}\n`);
+            } else {
                 console.log('—'.repeat(40));
-                console.log(`📊 Summary for ${courseDisplayName}:`);
-                console.log(`  ✅ Downloaded: ${paintGreen(String(downloadedCount))}`);
-                console.log(`  🟡 Skipped: ${paintYellow(String(skippedCount))}`);
-                console.log(`  ❌ Failed: ${paintRed(String(failedCount))}`);
-
-            } catch (courseError) {
-                logError(`FATAL ERROR processing course ${courseUrl}: ${courseError.message}`);
+                console.log(`📊 Statistics for ${courseDisplayName}:`);
+                console.log(`   Total Units: ${stats.total}`);
+                console.log(`   ✅ Downloaded:  ${paintGreen(stats.downloaded)}`);
+                console.log(`   📝 Markdown:    ${paintGreen(stats.markdown)}`);
+                console.log(`   🟡 Skipped:     ${paintYellow(stats.skipped)}`);
+                console.log(`   ❌ Failed:      ${paintRed(stats.failed)}`);
             }
         }
         
         console.log('\n' + '═'.repeat(60));
-        logSuccess('All courses from link.txt have been processed.');
-        await sleep(5000);
-
+        logSuccess('Process Terminated Successfully.');
+        writeLog('INFO', 'Process completed successfully');
     } catch (err) {
-        logError('A fatal error occurred:', err.message);
-        await sleep(10000); // Wait 10 seconds before exit on error
+        logError('FATAL PROCESS ERROR:', err.message);
+        writeLog('ERROR', `Fatal process error: ${err.message}`);
         process.exit(1);
     }
 }
