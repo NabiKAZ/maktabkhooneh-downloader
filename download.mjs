@@ -1079,19 +1079,39 @@ async function main() {
         const sessionFilePath = path.resolve(baseDir, sessionFile || 'session.json');
         const cookieFilePath = cookieFile ? path.resolve(baseDir, cookieFile) : null;
 
-        writeLog('INFO', `Preparing session for ${email || 'unknown user'}`);
-        const sessionResult = await prepareSession({ userEmail: email, userPassword: password, sessionFile: sessionFilePath, cookieFile: cookieFilePath, verbose, forceLogin });
-        
-        let coreData = sessionResult.core;
-        if (!coreData) {
-            try { coreData = await fetchCoreData(ORIGIN); } catch {}
-        }
+    // Iterate chapters and units
+    let totalUnits = 0, downloadedCount = 0, skippedCount = 0, failedCount = 0;
+    try {
+        for (let chapterIndex = 0; chapterIndex < chapters.length; chapterIndex++) {
+            const chapter = chapters[chapterIndex];
+            const chapterOrder = String(chapterIndex + 1).padStart(2, '0');
+            const chapterFolder = path.join(outputRootFolder, `${chapterOrder} - ${sanitizeName(chapter.title || chapter.slug || 'chapter')}`);
+            console.log(`📖 Chapter ${chapterIndex + 1}/${chapters.length}: ${paintBold(chapter.title || chapter.slug)}`);
 
-        if (coreData) {
-            printProfileSummary(coreData);
-        } else {
-            logWarn('No active session authenticated. Proceeding as guest/public access.');
-        }
+            // Support both old API (unit_set) and new API (units)
+            const units = Array.isArray(chapter.units) ? chapter.units : (Array.isArray(chapter.unit_set) ? chapter.unit_set : []);
+            for (let unitIndex = 0; unitIndex < units.length; unitIndex++) {
+                const unit = units[unitIndex];
+                // Old API: skip if status is explicitly falsy; new API has no status field so skip this check
+                if ('status' in unit && !unit.status) continue; // inactive (old API)
+                if (unit?.type !== 'lecture') continue; // skip non-video units
+                totalUnits++;
+                const unitOrder = String(unitIndex + 1).padStart(2, '0');
+                const baseFileName = `${unitOrder} - ${sanitizeName(unit.title || unit.slug || 'lecture')}.mp4`;
+                const finalFileName = (sampleBytesToDownload && sampleBytesToDownload > 0)
+                    ? baseFileName.replace(/\.mp4$/i, '.sample.mp4')
+                    : baseFileName;
+                const outputFilePath = path.join(chapterFolder, finalFileName);
+                verbose(`  🎬 Unit ${unitIndex + 1}/${units.length}: ${unit.title || unit.slug}`);
+
+                // Skip locked content or content requiring purchase
+                // Old API: unit.locked (boolean); New API: unit.view_access (10=free, 20=enrolled, 30=purchased, 40=subscription)
+                const isLocked = unit.locked === true;
+                if (isLocked) {
+                    logWarn(`🔒 Locked/No access: ${finalFileName}`);
+                    skippedCount++;
+                    continue;
+                }
 
         let courseUrls = [];
         if (positionalUrl) {
