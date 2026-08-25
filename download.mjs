@@ -3,6 +3,7 @@
  * 
  * Usage examples:
  *   node download.mjs "https://maktabkhooneh.org/course/<slug>/" --user you@example.com --pass "Secret123"
+ *   node download.mjs "https://maktabkhooneh.org/lms/course/<slug>/unit/<unit_id>/" --user you@example.com --pass "Secret123"
  *   node download.mjs "https://maktabkhooneh.org/course/<slug>/" --sample-bytes 65536 --verbose
  * 
  * Notes: Only download content you have legal rights to access.
@@ -131,7 +132,7 @@ function printUsage() {
 
     // Options
     console.log('\n' + paintBold('Options:'));
-    console.log(`  ${paintYellow('<course_url>')}                The maktabkhooneh course URL (e.g., https://maktabkhooneh.org/course/<slug>/)`);
+    console.log(`  ${paintYellow('<course_url>')}                The maktabkhooneh course URL (e.g., https://maktabkhooneh.org/course/<slug>/ or https://maktabkhooneh.org/lms/course/<slug>/unit/<unit_id>/)`);
     console.log(`  ${paintGreen('--sample-bytes')} ${paintYellow('N')}            Download only the first N bytes of each video (also via env MK_SAMPLE_BYTES)`);
     console.log(`  ${paintGreen('--user')} | ${paintGreen('--email')} ${paintYellow('<EMAIL>')}    Login with email (stores cookie in session file)`);
     console.log(`  ${paintGreen('--pass')} | ${paintGreen('--password')} ${paintYellow('<PASS>')}  Password for login (consider quoting)`);
@@ -146,6 +147,7 @@ function printUsage() {
     // Examples
     console.log('\n' + paintBold('Examples:'));
     console.log('  ' + paintCyan('node download.mjs "https://maktabkhooneh.org/course/<slug>/"'));
+    console.log('  ' + paintCyan('node download.mjs "https://maktabkhooneh.org/lms/course/<slug>/unit/<unit_id>/"'));
     console.log('  ' + paintCyan('node download.mjs "https://maktabkhooneh.org/course/<slug>/" --sample-bytes 65536 --verbose'));
     console.log('  ' + paintCyan('node download.mjs "https://maktabkhooneh.org/course/<slug>/" --user you@example.com --pass "Secret123"'));
     console.log('  ' + paintCyan('node download.mjs "https://maktabkhooneh.org/course/<slug>/" --user you@example.com --pass "Secret123" --force-login'));
@@ -203,6 +205,8 @@ function createVerboseLogger(isVerbose) {
 }
 
 // Parse the course slug from the full course URL.
+// Supports both old format: /course/<slug>/
+// and new format: /lms/course/<slug>/unit/<unit_id>/
 function extractCourseSlug(courseUrl) {
     try {
         const parsed = new URL(courseUrl);
@@ -210,12 +214,26 @@ function extractCourseSlug(courseUrl) {
             throw new Error('Unexpected origin: ' + parsed.origin);
         }
         const parts = parsed.pathname.split('/').filter(Boolean);
+        // New format: lms/course/<slug>/unit/<id>
+        const lmsIdx = parts.indexOf('lms');
+        if (lmsIdx !== -1 && parts[lmsIdx + 1] === 'course' && parts[lmsIdx + 2]) {
+            return parts[lmsIdx + 2];
+        }
+        // Old format: course/<slug>
         const idx = parts.indexOf('course');
         if (idx === -1 || !parts[idx + 1]) throw new Error('Cannot parse course slug');
         return parts[idx + 1];
     } catch (e) {
         throw new Error('Invalid course URL: ' + e.message);
     }
+}
+
+// Extract the numeric course id from a slug like "...-mk10645" (returns 10645).
+// Returns null if not found.
+function extractCourseIdFromSlug(slug) {
+    if (!slug) return null;
+    const m = slug.match(/-mk(\d+)$/i);
+    return m ? parseInt(m[1], 10) : null;
 }
 
 // Fetch with timeout.
@@ -260,11 +278,59 @@ async function getRemoteSizeAndRanges(url, referer) {
 }
 
 // API: fetch chapters JSON for a course.
-async function fetchChapters(courseSlug, referer) {
+// Tries the new LMS outline API first (needs numeric course id), then falls back to the old chapters API.
+async function fetchChapters(courseSlug, referer, courseId) {
+    // New API: /api/v1/lms/courses/<id>/outline/
+    if (courseId) {
+        try {
+            const apiUrl = `${ORIGIN}/api/v1/lms/courses/${courseId}/outline/`;
+            const res = await fetchWithTimeout(apiUrl, { method: 'GET', headers: { ...commonHeaders(referer), accept: 'application/json' } });
+            if (res.ok) {
+                const json = await res.json();
+                if (Array.isArray(json?.chapters)) return json;
+            }
+        } catch (e) {
+            // fall through to old API
+        }
+    }
+    // Old API: /api/v1/courses/<slug>/chapters/
     const apiUrl = `${ORIGIN}/api/v1/courses/${courseSlug}/chapters/`;
     const res = await fetchWithTimeout(apiUrl, { method: 'GET', headers: { ...commonHeaders(referer), accept: 'application/json' } });
     if (!res.ok) throw new Error(`Failed to fetch chapters: ${res.status} ${res.statusText}`);
     return res.json();
+}
+
+// API: fetch unit details (new format) - includes resources (attachments) and caption_file.
+async function fetchUnitDetails(unitId, referer) {
+    const apiUrl = `${ORIGIN}/api/v1/lms/units/${unitId}/`;
+    const res = await fetchWithTimeout(apiUrl, { method: 'GET', headers: { ...commonHeaders(referer), accept: 'application/json' } });
+    if (!res.ok) throw new Error(`Failed to fetch unit details: ${res.status} ${res.statusText}`);
+    return res.json();
+}
+
+// API: fetch video URL for a unit (new format) - returns qualities with download_url.
+async function fetchUnitVideoUrl(unitId, referer) {
+    const apiUrl = `${ORIGIN}/api/v1/lms/units/${unitId}/video_url/`;
+    const res = await fetchWithTimeout(apiUrl, { method: 'GET', headers: { ...commonHeaders(referer), accept: 'application/json' } });
+    if (!res.ok) throw new Error(`Failed to fetch video URL: ${res.status} ${res.statusText}`);
+    return res.json();
+}
+
+// Pick the best video download URL from a new-format video_url response.
+// Prefers the highest quality downloadable mp4; falls back to hq/lq.
+function pickBestVideoUrl(videoUrlData) {
+    if (!videoUrlData) return null;
+    // Prefer explicit mp4 qualities (highest resolution first)
+    const qualities = Array.isArray(videoUrlData.qualities) ? videoUrlData.qualities : [];
+    if (qualities.length > 0) {
+        const sorted = [...qualities].sort((a, b) => (b.resolution || 0) - (a.resolution || 0));
+        const withUrl = sorted.find(q => q.download_url);
+        if (withUrl) return withUrl.download_url;
+    }
+    // Fallback to video_urls.hq / lq
+    const v = videoUrlData.video_urls;
+    if (v) return v.hq || v.lq || null;
+    return null;
 }
 
 // API: core-data to verify authentication and basic profile.
@@ -290,7 +356,13 @@ function printProfileSummary(core) {
 }
 
 // Build lecture page URL for a specific chapter/unit.
-function buildLectureUrl(courseSlug, chapter, unit) {
+// New format: /lms/course/<slug>/unit/<unit_id>/  (uses numeric unit id)
+// Old format: /course/<slug>/<chapter-slug>-ch<id>/<unit-slug>/
+function buildLectureUrl(courseSlug, chapter, unit, useNewFormat = false) {
+    if (useNewFormat) {
+        const unitId = unit.id || unit.unit_id;
+        return `${ORIGIN}/lms/course/${encodeURIComponent(courseSlug)}/unit/${unitId}/`;
+    }
     const chapterSegment = `${encodeURIComponent(chapter.slug)}-ch${chapter.id}`;
     const unitSegment = encodeURIComponent(unit.slug);
     return `${ORIGIN}/course/${courseSlug}/${chapterSegment}/${unitSegment}/`;
@@ -876,6 +948,10 @@ async function main() {
 
     const normalizedCourseUrl = ensureTrailingSlash(inputCourseUrl.trim());
     const courseSlug = extractCourseSlug(normalizedCourseUrl);
+    // Detect new LMS format (URL contains /lms/course/.../unit/<id>/)
+    const isNewFormat = /\/lms\/course\//.test(normalizedCourseUrl);
+    // Numeric course id (from slug suffix -mk<id>)
+    const courseId = extractCourseIdFromSlug(courseSlug);
     // Use decoded slug (human-friendly, especially for Persian) for the top-level folder name
     const courseDisplayName = sanitizeName(decodeURIComponent(courseSlug));
     const outputRootFolder = path.resolve(process.cwd(), 'download', courseDisplayName);
@@ -903,9 +979,15 @@ async function main() {
 
     // Fetch chapters
     verbose(paintCyan('Fetching chapters...'));
-    const chaptersData = await fetchChapters(courseSlug, normalizedCourseUrl);
+    const chaptersData = await fetchChapters(courseSlug, normalizedCourseUrl, courseId);
     const chapters = Array.isArray(chaptersData?.chapters) ? chaptersData.chapters : [];
     if (chapters.length === 0) { logError('No chapters found. Make sure the URL and cookie are correct.'); process.exit(2); }
+
+    // Detect the actual data format from the response.
+    // New API units have numeric type (1 = Video Lecture); old API uses string 'lecture'.
+    const firstUnit = (chapters[0]?.units || chapters[0]?.unit_set || [])[0];
+    const dataIsNewFormat = firstUnit ? (typeof firstUnit.type === 'number') : isNewFormat;
+    const useNewFormat = isNewFormat || dataIsNewFormat;
 
     // Iterate chapters and units
     let totalUnits = 0, downloadedCount = 0, skippedCount = 0, failedCount = 0;
@@ -922,7 +1004,10 @@ async function main() {
                 const unit = units[unitIndex];
                 // Old API: skip if status is explicitly falsy; new API has no status field so skip this check
                 if ('status' in unit && !unit.status) continue; // inactive (old API)
-                if (unit?.type !== 'lecture') continue; // skip non-video units
+                // Determine if this is a video unit.
+                // Old API: unit.type === 'lecture'; New API: unit.type === 1 (Video Lecture)
+                const isVideoUnit = useNewFormat ? (unit.type === 1) : (unit.type === 'lecture');
+                if (!isVideoUnit) continue; // skip non-video units
                 totalUnits++;
                 const unitOrder = String(unitIndex + 1).padStart(2, '0');
                 const baseFileName = `${unitOrder} - ${sanitizeName(unit.title || unit.slug || 'lecture')}.mp4`;
@@ -941,16 +1026,43 @@ async function main() {
                     continue;
                 }
 
-                const lectureUrl = buildLectureUrl(courseSlug, chapter, unit);
+                const lectureUrl = buildLectureUrl(courseSlug, chapter, unit, useNewFormat);
                 try {
-                    // Fetch lecture page HTML
-                    const res = await fetchWithTimeout(lectureUrl, { headers: { ...commonHeaders(normalizedCourseUrl), accept: 'text/html' } });
-                    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-                    const html = await res.text();
-                    const videoSources = extractVideoSources(html);
-                    const bestSourceUrl = pickBestSource(videoSources);
-                    if (!bestSourceUrl) { logWarn(`No video source found for: ${finalFileName}`); skippedCount++; continue; }
+                    let bestSourceUrl = null;
+                    let captionFile = null;
+                    let attachmentLinks = [];
 
+                    if (useNewFormat) {
+                        // ---- New API: fetch video URL + unit details via JSON endpoints ----
+                        const unitId = unit.id || unit.unit_id;
+                        const [videoUrlData, unitDetails] = await Promise.all([
+                            fetchUnitVideoUrl(unitId, normalizedCourseUrl).catch(() => null),
+                            fetchUnitDetails(unitId, normalizedCourseUrl).catch(() => null)
+                        ]);
+                        bestSourceUrl = pickBestVideoUrl(videoUrlData);
+                        // Caption file (subtitle) from unit details
+                        captionFile = unitDetails?.caption_file || null;
+                        // Attachments: resources that are NOT video (type !== 1) with a download_url
+                        if (Array.isArray(unitDetails?.resources)) {
+                            attachmentLinks = unitDetails.resources
+                                .filter(r => r && r.type !== 1 && r.download_url)
+                                .map(r => r.download_url);
+                        }
+                    } else {
+                        // ---- Old API: scrape lecture page HTML ----
+                        const res = await fetchWithTimeout(lectureUrl, { headers: { ...commonHeaders(normalizedCourseUrl), accept: 'text/html' } });
+                        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                        const html = await res.text();
+                        const videoSources = extractVideoSources(html);
+                        bestSourceUrl = pickBestSource(videoSources);
+                        // Subtitles from HTML <track> tags
+                        const subtitleLinks = extractSubtitleLinks(html);
+                        if (subtitleLinks.length > 0) captionFile = subtitleLinks[0];
+                        // Attachments from HTML
+                        attachmentLinks = extractAttachmentLinks(html);
+                    }
+
+                    if (!bestSourceUrl) { logWarn(`No video source found for: ${finalFileName}`); skippedCount++; continue; }
 
                     // Print the filename on its own line; progress bar will render on the next line
                     console.log(`📥 Downloading: ${finalFileName}`);
@@ -959,66 +1071,63 @@ async function main() {
                     else { logSuccess(`DOWNLOADED: ${finalFileName}`); downloadedCount++; }
 
                     // ---- Subtitles (download beside video, same base name) ----
-                    try {
-                        const subtitleLinks = extractSubtitleLinks(html);
-                        if (subtitleLinks.length > 0) {
+                    if (captionFile) {
+                        try {
                             const videoBaseNoExt = finalFileName.replace(/\.sample\.mp4$/i, '').replace(/\.mp4$/i, '');
-                            for (const sUrl of subtitleLinks) {
-                                try {
-                                    const absUrl = (() => { try { return new URL(sUrl, ORIGIN).toString(); } catch { return sUrl; } })();
-                                    // determine extension from pathname or fallback to .vtt
-                                    let ext = '.vtt';
-                                    try { const up = new URL(absUrl); ext = path.extname(up.pathname) || '.vtt'; } catch { }
-                                    const subtitleName = `${videoBaseNoExt}${ext}`;
-                                    const subtitlePath = path.join(chapterFolder, subtitleName);
-                                    if (fs.existsSync(subtitlePath) && fs.statSync(subtitlePath).size > 0) {
-                                        console.log(paintYellow(`🟡 Subtitle exists: ${subtitleName}`));
-                                        continue;
-                                    }
-                                    console.log(`📝 Subtitle: ${subtitleName}`);
-                                    const sStatus = await downloadToFile(absUrl, subtitlePath, lectureUrl, 3, 0, '');
-                                    if (sStatus === 'exists') console.log(paintYellow(`🟡 Subtitle exists: ${subtitleName}`));
-                                    else logSuccess(`SUBTITLE: ${subtitleName}`);
-                                    await sleep(150);
-                                } catch (subErr) { logWarn(`Subtitle fail: ${subErr.message}`); }
+                            const subtitleName = `${videoBaseNoExt}.vtt`;
+                            const subtitlePath = path.join(chapterFolder, subtitleName);
+                            // New-format caption_file is a signed URL ending with "?file=" (empty).
+                            // The frontend appends the desired filename to that parameter.
+                            let absUrl = captionFile;
+                            try {
+                                const u = new URL(captionFile, ORIGIN);
+                                const fileParam = u.searchParams.get('file');
+                                if (fileParam === '' || fileParam == null) {
+                                    u.searchParams.set('file', subtitleName);
+                                }
+                                absUrl = u.toString();
+                            } catch { }
+                            if (fs.existsSync(subtitlePath) && fs.statSync(subtitlePath).size > 0) {
+                                console.log(paintYellow(`🟡 Subtitle exists: ${subtitleName}`));
+                            } else {
+                                console.log(`📝 Subtitle: ${subtitleName}`);
+                                const sStatus = await downloadToFile(absUrl, subtitlePath, lectureUrl, 3, 0, '');
+                                if (sStatus === 'exists') console.log(paintYellow(`🟡 Subtitle exists: ${subtitleName}`));
+                                else logSuccess(`SUBTITLE: ${subtitleName}`);
+                                await sleep(150);
                             }
-                        }
-                    } catch (subOuter) { logWarn(`Subtitle parse error: ${subOuter.message}`); }
+                        } catch (subErr) { logWarn(`Subtitle fail: ${subErr.message}`); }
+                    }
 
                     // ---- Attachments (download beside video) ----
-                    try {
-                        const attachmentLinks = extractAttachmentLinks(html);
-                        if (attachmentLinks.length > 0) {
-                            // Derive base (remove .sample.mp4 or .mp4)
-                            const videoBaseNoExt = finalFileName.replace(/\.sample\.mp4$/i, '').replace(/\.mp4$/i, '');
-                            for (const attUrl of attachmentLinks) {
+                    if (attachmentLinks.length > 0) {
+                        // Derive base (remove .sample.mp4 or .mp4)
+                        const videoBaseNoExt = finalFileName.replace(/\.sample\.mp4$/i, '').replace(/\.mp4$/i, '');
+                        for (const attUrl of attachmentLinks) {
+                            try {
+                                // Extract original filename from URL path (strip query)
+                                let filePart;
                                 try {
-                                    // Extract original filename from URL path (strip query)
-                                    let filePart;
-                                    try {
-                                        const u = new URL(attUrl);
-                                        filePart = u.pathname.split('/').pop() || 'attachment.bin';
-                                    } catch { filePart = attUrl.split('?')[0].split('/').pop() || 'attachment.bin'; }
-                                    // Keep original name (with underscores) but sanitize forbidden characters
-                                    const sanitizedAttachment = sanitizeName(filePart);
-                                    const finalAttachmentName = `${videoBaseNoExt} - ${sanitizedAttachment}`;
-                                    const attachmentPath = path.join(chapterFolder, finalAttachmentName);
-                                    if (fs.existsSync(attachmentPath) && fs.statSync(attachmentPath).size > 0) {
-                                        console.log(paintYellow(`🟡 Attachment exists: ${finalAttachmentName}`));
-                                        continue;
-                                    }
-                                    console.log(`📎 Attachment: ${finalAttachmentName}`);
-                                    const aStatus = await downloadToFile(attUrl, attachmentPath, lectureUrl, 3, 0, '');
-                                    if (aStatus === 'exists') console.log(paintYellow(`🟡 Attachment exists: ${finalAttachmentName}`));
-                                    else logSuccess(`ATTACHMENT: ${finalAttachmentName}`);
-                                    await sleep(200);
-                                } catch (attErr) {
-                                    logWarn(`Attachment fail: ${attErr.message}`);
+                                    const u = new URL(attUrl);
+                                    filePart = u.pathname.split('/').pop() || 'attachment.bin';
+                                } catch { filePart = attUrl.split('?')[0].split('/').pop() || 'attachment.bin'; }
+                                // Keep original name (with underscores) but sanitize forbidden characters
+                                const sanitizedAttachment = sanitizeName(filePart);
+                                const finalAttachmentName = `${videoBaseNoExt} - ${sanitizedAttachment}`;
+                                const attachmentPath = path.join(chapterFolder, finalAttachmentName);
+                                if (fs.existsSync(attachmentPath) && fs.statSync(attachmentPath).size > 0) {
+                                    console.log(paintYellow(`🟡 Attachment exists: ${finalAttachmentName}`));
+                                    continue;
                                 }
+                                console.log(`📎 Attachment: ${finalAttachmentName}`);
+                                const aStatus = await downloadToFile(attUrl, attachmentPath, lectureUrl, 3, 0, '');
+                                if (aStatus === 'exists') console.log(paintYellow(`🟡 Attachment exists: ${finalAttachmentName}`));
+                                else logSuccess(`ATTACHMENT: ${finalAttachmentName}`);
+                                await sleep(200);
+                            } catch (attErr) {
+                                logWarn(`Attachment fail: ${attErr.message}`);
                             }
                         }
-                    } catch (attOuterErr) {
-                        logWarn(`Attachment parse error: ${attOuterErr.message}`);
                     }
                     // polite pause
                     await sleep(400);

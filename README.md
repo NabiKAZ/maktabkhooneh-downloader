@@ -32,6 +32,12 @@ https://github.com/user-attachments/assets/38ecfd3e-4281-4e20-854d-18ad5dae5691
 	 node download.mjs "https://maktabkhooneh.org/course/<slug>/" --user you@example.com --pass "Secret123" 
 	 ```
 	 در اولین ورود، کوکی (csrftoken + sessionid) در فایل پیش‌فرض `session.json` ذخیره می‌شود و دفعات بعد بدون نیاز به پسورد استفاده می‌گردد (مگر این که منقضی شود یا `--force-login` بزنید).
+
+> **💡 فرمت جدید آدرس دوره (LMS):** این ابزار از هر دو فرمت آدرس پشتیبانی می‌کند:
+> - فرمت قدیمی: `https://maktabkhooneh.org/course/<slug>/`
+> - فرمت جدید: `https://maktabkhooneh.org/lms/course/<slug>/unit/<unit_id>/`
+>
+> در فرمت جدید، شناسه عددی دوره از پسوند `-mk<id>` در slug استخراج می‌شود و ویدیوها از طریق API جدید (`/api/v1/lms/...`) دریافت می‌گردند. اگر آدرس یک واحد خاص (`unit/<unit_id>`) را بدهید، همچنان کل دوره دانلود می‌شود.
 2. استفاده از کوکی آماده (Override):
 	 اگر نمی‌خواهید پسورد را در خط فرمان بزنید، می‌توانید کوکی را به صورت دستی (مانند قبل) ست کنید تا لاگین خودکار نادیده گرفته شود.
 
@@ -106,6 +112,11 @@ node download.mjs --help
 اجرای دانلود:
 ```powershell
 node download.mjs "https://maktabkhooneh.org/course/<slug>/" 
+```
+
+اجرای دانلود با آدرس فرمت جدید (LMS):
+```powershell
+node download.mjs "https://maktabkhooneh.org/lms/course/<slug>/unit/<unit_id>/" 
 ```
 
 اجرای دانلود با ورود خودکار و ذخیره نشست:
