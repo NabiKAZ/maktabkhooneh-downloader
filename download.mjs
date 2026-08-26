@@ -1040,8 +1040,9 @@ async function main() {
                             fetchUnitDetails(unitId, normalizedCourseUrl).catch(() => null)
                         ]);
                         bestSourceUrl = pickBestVideoUrl(videoUrlData);
-                        // Caption file (subtitle) from unit details
-                        captionFile = unitDetails?.caption_file || null;
+                        // Caption file (subtitle) from unit details — only if has_caption is true
+                        const hasCaption = unitDetails?.has_caption === true;
+                        captionFile = hasCaption ? (unitDetails?.caption_file || null) : null;
                         // Attachments: resources that are NOT video (type !== 1) with a download_url
                         if (Array.isArray(unitDetails?.resources)) {
                             attachmentLinks = unitDetails.resources
