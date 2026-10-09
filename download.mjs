@@ -21,6 +21,7 @@ import path from 'path';
 import { Transform, Readable } from 'stream';
 import { pipeline } from 'stream/promises';
 import { setTimeout as sleep } from 'timers/promises';
+import readline from 'readline/promises';
 
 // ===============
 // Console styling (ANSI colors) and emojis
@@ -62,6 +63,9 @@ const COOKIE = (() => {
 let ACTIVE_COOKIE = null;
 // Sample mode default (0 means full download)
 const DEFAULT_SAMPLE_BYTES = 0;
+// Video quality: 'best' | 'high' | 'medium' | 'low' | 'worst' | 'ask' | <height e.g. 480 or 480p>
+// (can be set with --quality or env MK_QUALITY)
+let QUALITY = 'best';
 
 // Ensure Node 18+ for global fetch
 if (typeof fetch !== 'function') {
@@ -134,6 +138,7 @@ function printUsage() {
     console.log('\n' + paintBold('Options:'));
     console.log(`  ${paintYellow('<course_url>')}                The maktabkhooneh course URL (e.g., https://maktabkhooneh.org/course/<slug>/ or https://maktabkhooneh.org/lms/course/<slug>/unit/<unit_id>/)`);
     console.log(`  ${paintGreen('--sample-bytes')} ${paintYellow('N')}            Download only the first N bytes of each video (also via env MK_SAMPLE_BYTES)`);
+    console.log(`  ${paintGreen('--quality')} | ${paintGreen('-q')} ${paintYellow('Q')}          Video quality: best (default), high, medium, low, worst, ask, or a height like 480 / 480p`);
     console.log(`  ${paintGreen('--user')} | ${paintGreen('--email')} ${paintYellow('<EMAIL>')}    Login with email (stores cookie in session file)`);
     console.log(`  ${paintGreen('--pass')} | ${paintGreen('--password')} ${paintYellow('<PASS>')}  Password for login (consider quoting)`);
     console.log(`  ${paintGreen('--session-file')} ${paintYellow('<FILE>')}       Session store path (default: session.json, multi-user)`);
@@ -143,12 +148,16 @@ function printUsage() {
     console.log('\n' + paintBold('Env vars:'));
     console.log(`    MK_COOKIE / MK_COOKIE_FILE   Override cookie manually (bypass credential login)`);
     console.log(`    MK_SAMPLE_BYTES              Default sample bytes (overridden by --sample-bytes)`);
+    console.log(`    MK_QUALITY                   Default video quality (overridden by --quality)`);
 
     // Examples
     console.log('\n' + paintBold('Examples:'));
     console.log('  ' + paintCyan('node download.mjs "https://maktabkhooneh.org/course/<slug>/"'));
     console.log('  ' + paintCyan('node download.mjs "https://maktabkhooneh.org/lms/course/<slug>/unit/<unit_id>/"'));
     console.log('  ' + paintCyan('node download.mjs "https://maktabkhooneh.org/course/<slug>/" --sample-bytes 65536 --verbose'));
+    console.log('  ' + paintCyan('node download.mjs "https://maktabkhooneh.org/course/<slug>/" --quality 480'));
+    console.log('  ' + paintCyan('node download.mjs "https://maktabkhooneh.org/course/<slug>/" --quality low'));
+    console.log('  ' + paintCyan('node download.mjs "https://maktabkhooneh.org/course/<slug>/" --quality ask'));
     console.log('  ' + paintCyan('node download.mjs "https://maktabkhooneh.org/course/<slug>/" --user you@example.com --pass "Secret123"'));
     console.log('  ' + paintCyan('node download.mjs "https://maktabkhooneh.org/course/<slug>/" --user you@example.com --pass "Secret123" --force-login'));
     console.log('');
@@ -163,6 +172,7 @@ function parseCLI() {
     let userPassword = null;
     let sessionFile = 'session.json';
     let forceLogin = false;
+    let quality = (process.env.MK_QUALITY || '').trim() || 'best';
     for (let i = 0; i < args.length; i++) {
         const a = args[i];
         if (a === '--help' || a === '-h') {
@@ -186,6 +196,10 @@ function parseCLI() {
         } else if (a === '--sample-bytes') {
             const v = args[i + 1];
             if (v) { sampleBytesToDownload = parseInt(v, 10) || 0; i++; }
+        } else if (a === '--quality' || a === '-q') {
+            const v = args[i + 1]; if (v) { quality = v; i++; }
+        } else if (a.startsWith('--quality=')) {
+            quality = a.split('=')[1];
         } else if (a === '--verbose' || a === '-v') {
             isVerboseLoggingEnabled = true;
         } else if (a === '--force-login') {
@@ -197,7 +211,20 @@ function parseCLI() {
     if (!sampleBytesToDownload && process.env.MK_SAMPLE_BYTES) {
         sampleBytesToDownload = parseInt(process.env.MK_SAMPLE_BYTES, 10) || 0;
     }
-    return { inputCourseUrl, sampleBytesToDownload, isVerboseLoggingEnabled, userEmail, userPassword, sessionFile, forceLogin };
+    quality = normalizeQuality(quality);
+    return { inputCourseUrl, sampleBytesToDownload, isVerboseLoggingEnabled, userEmail, userPassword, sessionFile, forceLogin, quality };
+}
+
+// Normalize a quality string to: best | high | medium | low | worst | ask | <number>
+function normalizeQuality(q) {
+    const v = String(q || 'best').trim().toLowerCase();
+    if (['best', 'high', 'medium', 'low', 'worst', 'ask'].includes(v)) return v;
+    if (v === 'hq' || v === 'max') return 'best';
+    if (v === 'lq' || v === 'min') return 'worst';
+    const m = v.match(/^(\d{3,4})p?$/);
+    if (m) return parseInt(m[1], 10);
+    logWarn(`Unknown quality "${q}", falling back to "best".`);
+    return 'best';
 }
 
 function createVerboseLogger(isVerbose) {
@@ -316,21 +343,69 @@ async function fetchUnitVideoUrl(unitId, referer) {
     return res.json();
 }
 
-// Pick the best video download URL from a new-format video_url response.
-// Prefers the highest quality downloadable mp4; falls back to hq/lq.
+// List downloadable qualities (highest resolution first) from a new-format video_url response.
+function listQualities(videoUrlData) {
+    const qualities = Array.isArray(videoUrlData?.qualities) ? videoUrlData.qualities : [];
+    return qualities
+        .filter(q => q && q.download_url)
+        .sort((a, b) => (Number(b.resolution) || 0) - (Number(a.resolution) || 0));
+}
+
+// Choose an entry from a list sorted highest -> lowest according to the requested quality.
+function chooseByQuality(sorted, quality) {
+    if (sorted.length === 0) return null;
+    if (quality === 'best' || quality === 'ask') return sorted[0];
+    if (quality === 'worst' || quality === 'low') return sorted[sorted.length - 1];
+    if (quality === 'high') return sorted[0];
+    if (quality === 'medium') return sorted[Math.floor((sorted.length - 1) / 2)];
+    if (typeof quality === 'number') {
+        // Highest quality that does not exceed the target; otherwise the lowest one available.
+        const atOrBelow = sorted.find(q => (Number(q.resolution) || 0) <= quality);
+        return atOrBelow || sorted[sorted.length - 1];
+    }
+    return sorted[0];
+}
+
+// Pick the video download URL from a new-format video_url response based on QUALITY.
+// Falls back to video_urls.hq / lq when no explicit qualities are available.
 function pickBestVideoUrl(videoUrlData) {
     if (!videoUrlData) return null;
-    // Prefer explicit mp4 qualities (highest resolution first)
-    const qualities = Array.isArray(videoUrlData.qualities) ? videoUrlData.qualities : [];
-    if (qualities.length > 0) {
-        const sorted = [...qualities].sort((a, b) => (b.resolution || 0) - (a.resolution || 0));
-        const withUrl = sorted.find(q => q.download_url);
-        if (withUrl) return withUrl.download_url;
+    const sorted = listQualities(videoUrlData);
+    if (sorted.length > 0) {
+        const chosen = chooseByQuality(sorted, QUALITY);
+        if (chosen) {
+            if (typeof QUALITY === 'number' && Number(chosen.resolution) > QUALITY) {
+                logWarn(`No quality <= ${QUALITY}p available, using lowest: ${chosen.resolution}p`);
+            }
+            return chosen.download_url;
+        }
     }
-    // Fallback to video_urls.hq / lq
     const v = videoUrlData.video_urls;
-    if (v) return v.hq || v.lq || null;
+    if (v) {
+        const wantLow = QUALITY === 'low' || QUALITY === 'worst' || QUALITY === 'medium' || (typeof QUALITY === 'number' && QUALITY < 480);
+        return wantLow ? (v.lq || v.hq || null) : (v.hq || v.lq || null);
+    }
     return null;
+}
+
+// Interactive prompt: let the user pick a quality (once) from what the first video offers.
+async function promptQuality(options) {
+    // options: [{ label, value }]
+    if (!process.stdin.isTTY) {
+        logWarn('--quality ask needs an interactive terminal; using "best".');
+        return 'best';
+    }
+    console.log(paintBold('\n🎚️  Available qualities:'));
+    options.forEach((o, i) => console.log(`  ${paintYellow(String(i + 1))}) ${o.label}`));
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    try {
+        while (true) {
+            const ans = (await rl.question(`Select quality [1-${options.length}] (default 1): `)).trim();
+            if (ans === '') return options[0].value;
+            const n = parseInt(ans, 10);
+            if (n >= 1 && n <= options.length) return options[n - 1].value;
+        }
+    } finally { rl.close(); }
 }
 
 // API: core-data to verify authentication and basic profile.
@@ -394,11 +469,14 @@ function extractVideoSources(html) {
     return Array.from(new Set(urls));
 }
 
-// Pick best source, prefer HQ.
+// Pick source from lecture page HTML based on QUALITY (old format only offers hq / lq).
 function pickBestSource(urls) {
     if (!urls || urls.length === 0) return null;
-    const hq = urls.find(u => /\/videos\/hq\d+/.test(u) || u.includes('/videos/hq'));
-    return hq || urls[0];
+    const isHq = u => /\/videos\/hq\d+/.test(u) || u.includes('/videos/hq');
+    const hq = urls.find(isHq);
+    const lq = urls.find(u => !isHq(u));
+    const wantLow = QUALITY === 'low' || QUALITY === 'worst' || QUALITY === 'medium' || (typeof QUALITY === 'number' && QUALITY < 480);
+    return (wantLow ? (lq || hq) : (hq || lq)) || urls[0];
 }
 
 // Sanitize a string for safe Windows filenames.
@@ -939,7 +1017,8 @@ async function downloadToFile(url, filePath, referer, maxRetries = 3, sampleByte
 }
 
 async function main() {
-    const { inputCourseUrl, sampleBytesToDownload, isVerboseLoggingEnabled, userEmail, userPassword, sessionFile, forceLogin } = parseCLI();
+    const { inputCourseUrl, sampleBytesToDownload, isVerboseLoggingEnabled, userEmail, userPassword, sessionFile, forceLogin, quality } = parseCLI();
+    QUALITY = quality;
     const { verbose } = createVerboseLogger(isVerboseLoggingEnabled);
     if (!inputCourseUrl) { printUsage(); process.exit(1); }
     // Attempt to load / create / verify session (may already return core)
@@ -973,6 +1052,7 @@ async function main() {
 
     console.log(`📚 Course slug: ${paintBold(decodeURIComponent(courseSlug))}`);
     console.log(`📁 Output folder: ${paintCyan(outputRootFolder)}`);
+    console.log(`🎚️  Quality: ${paintBold(typeof QUALITY === 'number' ? `${QUALITY}p (or closest lower)` : QUALITY)}`);
     if (sampleBytesToDownload && sampleBytesToDownload > 0) {
         console.log(`🎯 Sample mode: downloading first ${paintBold(String(sampleBytesToDownload))} bytes of each video (saved as .sample.mp4)`);
     }
@@ -1039,6 +1119,14 @@ async function main() {
                             fetchUnitVideoUrl(unitId, normalizedCourseUrl).catch(() => null),
                             fetchUnitDetails(unitId, normalizedCourseUrl).catch(() => null)
                         ]);
+                        if (QUALITY === 'ask' && videoUrlData) {
+                            const qs = listQualities(videoUrlData);
+                            const opts = qs.length > 0
+                                ? qs.map(q => ({ label: `${q.resolution}p`, value: Number(q.resolution) || 'best' }))
+                                : [{ label: 'high (hq)', value: 'best' }, { label: 'low (lq)', value: 'low' }];
+                            QUALITY = await promptQuality(opts);
+                            console.log(`🎚️  Selected quality: ${paintBold(String(QUALITY))}`);
+                        }
                         bestSourceUrl = pickBestVideoUrl(videoUrlData);
                         // Caption file (subtitle) from unit details — only if has_caption is true
                         const hasCaption = unitDetails?.has_caption === true;
@@ -1055,6 +1143,10 @@ async function main() {
                         if (!res.ok) throw new Error(`HTTP ${res.status}`);
                         const html = await res.text();
                         const videoSources = extractVideoSources(html);
+                        if (QUALITY === 'ask') {
+                            QUALITY = await promptQuality([{ label: 'high (hq)', value: 'best' }, { label: 'low (lq)', value: 'low' }]);
+                            console.log(`🎚️  Selected quality: ${paintBold(String(QUALITY))}`);
+                        }
                         bestSourceUrl = pickBestSource(videoSources);
                         // Subtitles from HTML <track> tags
                         const subtitleLinks = extractSubtitleLinks(html);
